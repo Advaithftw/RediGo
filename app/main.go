@@ -35,5 +35,6 @@ func main() {
 			break
 		}
 		conn.Write([]byte("+PONG\r\n"))
+		writer.Flush()
 	}
 }
