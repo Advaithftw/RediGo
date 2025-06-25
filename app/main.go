@@ -8,10 +8,16 @@ import (
 	"strings"
 	"strconv"
 	"sync"
+	"time"
 )
 
-var store = make(map[string]string) // In-memory key-value store
-var mu sync.RWMutex                 // Mutex to safely handle concurrent access
+type entry struct {
+	value    string
+	expireAt time.Time // zero time if no expiry
+}
+
+var store = make(map[string]entry)
+var mu sync.RWMutex
 
 func main() {
 	l, err := net.Listen("tcp", "0.0.0.0:6379")
@@ -23,7 +29,7 @@ func main() {
 	for {
 		conn, err := l.Accept()
 		if err != nil {
-			fmt.Println("Error accepting connection:", err)
+			fmt.Println("Connection error:", err)
 			continue
 		}
 		go handleConnection(conn)
@@ -41,13 +47,12 @@ func handleConnection(conn net.Conn) {
 		}
 
 		line = strings.TrimSpace(line)
-
 		if strings.HasPrefix(line, "*") {
 			numArgs, _ := strconv.Atoi(line[1:])
 			parts := make([]string, 0, numArgs)
 
 			for i := 0; i < numArgs; i++ {
-				_, err := reader.ReadString('\n') // skip $<length>
+				_, err := reader.ReadString('\n') // skip $<len>
 				if err != nil {
 					return
 				}
@@ -74,27 +79,41 @@ func handleConnection(conn net.Conn) {
 					conn.Write([]byte(resp))
 				}
 			case "SET":
-				if len(parts) == 3 {
-					key := parts[1]
-					val := parts[2]
-					mu.Lock()
-					store[key] = val
-					mu.Unlock()
-					conn.Write([]byte("+OK\r\n"))
-				}
-			case "GET":
-				if len(parts) == 2 {
-					key := parts[1]
-					mu.RLock()
-					val, exists := store[key]
-					mu.RUnlock()
-					if exists {
-						resp := fmt.Sprintf("$%d\r\n%s\r\n", len(val), val)
-						conn.Write([]byte(resp))
-					} else {
-						conn.Write([]byte("$-1\r\n")) // null bulk string
+				key := parts[1]
+				val := parts[2]
+				var expireAt time.Time
+
+				// Handle optional PX expiry
+				if len(parts) == 5 && strings.ToUpper(parts[3]) == "PX" {
+					ms, err := strconv.Atoi(parts[4])
+					if err == nil {
+						expireAt = time.Now().Add(time.Duration(ms) * time.Millisecond)
 					}
 				}
+
+				mu.Lock()
+				store[key] = entry{value: val, expireAt: expireAt}
+				mu.Unlock()
+
+				conn.Write([]byte("+OK\r\n"))
+
+			case "GET":
+				key := parts[1]
+				mu.RLock()
+				e, exists := store[key]
+				mu.RUnlock()
+
+				if !exists || ( !e.expireAt.IsZero() && time.Now().After(e.expireAt)) {
+					// expired
+					mu.Lock()
+					delete(store, key)
+					mu.Unlock()
+					conn.Write([]byte("$-1\r\n"))
+				} else {
+					resp := fmt.Sprintf("$%d\r\n%s\r\n", len(e.value), e.value)
+					conn.Write([]byte(resp))
+				}
+
 			default:
 				conn.Write([]byte("-ERR unknown command\r\n"))
 			}
