@@ -34,7 +34,11 @@ func main() {
 		if err != nil {
 			break
 		}
+		line = strings.TrimSpace(line)
+
+	if line == "PING" {
 		conn.Write([]byte("+PONG\r\n"))
-		writer.Flush()
+	}
+		
 	}
 }
