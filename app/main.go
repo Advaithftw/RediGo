@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"flag"
 	"fmt"
 	"net"
 	"os"
@@ -13,13 +14,25 @@ import (
 
 type entry struct {
 	value    string
-	expireAt time.Time // zero time if no expiry
+	expireAt time.Time
 }
 
 var store = make(map[string]entry)
 var mu sync.RWMutex
 
+// New: variables to hold config values
+var configDir string
+var configFilename string
+
 func main() {
+	// New: Parse flags from CLI
+	dirFlag := flag.String("dir", ".", "Directory for RDB file")
+	fileFlag := flag.String("dbfilename", "dump.rdb", "RDB file name")
+	flag.Parse()
+
+	configDir = *dirFlag
+	configFilename = *fileFlag
+
 	l, err := net.Listen("tcp", "0.0.0.0:6379")
 	if err != nil {
 		fmt.Println("Failed to bind to port 6379")
@@ -45,8 +58,8 @@ func handleConnection(conn net.Conn) {
 		if err != nil {
 			break
 		}
-
 		line = strings.TrimSpace(line)
+
 		if strings.HasPrefix(line, "*") {
 			numArgs, _ := strconv.Atoi(line[1:])
 			parts := make([]string, 0, numArgs)
@@ -72,29 +85,27 @@ func handleConnection(conn net.Conn) {
 			switch cmd {
 			case "PING":
 				conn.Write([]byte("+PONG\r\n"))
+
 			case "ECHO":
 				if len(parts) == 2 {
 					msg := parts[1]
 					resp := fmt.Sprintf("$%d\r\n%s\r\n", len(msg), msg)
 					conn.Write([]byte(resp))
 				}
+
 			case "SET":
 				key := parts[1]
 				val := parts[2]
 				var expireAt time.Time
-
-				// Handle optional PX expiry
 				if len(parts) == 5 && strings.ToUpper(parts[3]) == "PX" {
 					ms, err := strconv.Atoi(parts[4])
 					if err == nil {
 						expireAt = time.Now().Add(time.Duration(ms) * time.Millisecond)
 					}
 				}
-
 				mu.Lock()
 				store[key] = entry{value: val, expireAt: expireAt}
 				mu.Unlock()
-
 				conn.Write([]byte("+OK\r\n"))
 
 			case "GET":
@@ -102,9 +113,7 @@ func handleConnection(conn net.Conn) {
 				mu.RLock()
 				e, exists := store[key]
 				mu.RUnlock()
-
-				if !exists || ( !e.expireAt.IsZero() && time.Now().After(e.expireAt)) {
-					// expired
+				if !exists || (!e.expireAt.IsZero() && time.Now().After(e.expireAt)) {
 					mu.Lock()
 					delete(store, key)
 					mu.Unlock()
@@ -112,6 +121,27 @@ func handleConnection(conn net.Conn) {
 				} else {
 					resp := fmt.Sprintf("$%d\r\n%s\r\n", len(e.value), e.value)
 					conn.Write([]byte(resp))
+				}
+
+			case "CONFIG":
+				if len(parts) == 3 && strings.ToUpper(parts[1]) == "GET" {
+					param := strings.ToLower(parts[2])
+					var value string
+					if param == "dir" {
+						value = configDir
+					} else if param == "dbfilename" {
+						value = configFilename
+					} else {
+						conn.Write([]byte("*0\r\n")) // Empty array if unknown
+						continue
+					}
+					// RESP Array: *2\r\n$<len>\r\n<key>\r\n$<len>\r\n<value>\r\n
+					resp := fmt.Sprintf("*2\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
+						len(param), param,
+						len(value), value)
+					conn.Write([]byte(resp))
+				} else {
+					conn.Write([]byte("-ERR unknown CONFIG command\r\n"))
 				}
 
 			default:
