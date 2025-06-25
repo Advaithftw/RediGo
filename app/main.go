@@ -31,7 +31,7 @@ func main() {
 	}
 	reader := bufio.NewReader(conn)
 	for {
-		_, err := reader.ReadString('\n')
+		line, err := reader.ReadString('\n')
 		if err != nil {
 			break
 		}
