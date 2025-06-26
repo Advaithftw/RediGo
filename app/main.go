@@ -182,6 +182,28 @@ func handleConnection(conn net.Conn) {
 				} else {
 					conn.Write([]byte("-ERR only INFO replication is supported\r\n"))
 				}
+				case "REPLCONF":
+	// Just acknowledge REPLCONF commands
+	conn.Write([]byte("+OK\r\n"))
+
+case "PSYNC":
+	if len(parts) == 3 {
+		// Full resync response
+		resp := fmt.Sprintf("+FULLRESYNC %s %d\r\n", masterReplId, masterReplOffset)
+		conn.Write([]byte(resp))
+
+		// Send RDB snapshot in RESP format (simplified)
+		var rdb strings.Builder
+		mu.RLock()
+		rdb.WriteString(fmt.Sprintf("$%d\r\n", len(store)))
+		for k, v := range store {
+			rdb.WriteString(fmt.Sprintf("*2\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
+				len(k), k, len(v.value), v.value))
+		}
+		mu.RUnlock()
+		conn.Write([]byte(rdb.String()))
+	}
+
 
 			default:
 				conn.Write([]byte("-ERR unknown command\r\n"))
