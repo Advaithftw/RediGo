@@ -41,6 +41,10 @@ func main() {
 	rdbPath := configDir + "/" + configFilename
 	loadRDB(rdbPath)
 
+	if isReplica {
+		go startReplica(*replicaFlag, *portFlag)
+	}
+
 	addr := fmt.Sprintf("0.0.0.0:%d", *portFlag)
 	l, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -56,6 +60,29 @@ func main() {
 		}
 		go handleConnection(conn)
 	}
+}
+
+func startReplica(masterAddr string, replicaPort int) {
+	conn, err := net.Dial("tcp", masterAddr)
+	if err != nil {
+		fmt.Println("Replica dial error:", err)
+		return
+	}
+	defer conn.Close()
+	r := bufio.NewReader(conn)
+
+	// 1. Send PING
+	conn.Write([]byte("*1\r\n$4\r\nPING\r\n"))
+	r.ReadString('\n') // Expect +PONG
+
+	// 2. Send REPLCONF with port
+	portStr := strconv.Itoa(replicaPort)
+	conn.Write([]byte(fmt.Sprintf("*3\r\n$8\r\nREPLCONF\r\n$4\r\nport\r\n$%d\r\n%s\r\n", len(portStr), portStr)))
+	r.ReadString('\n') // Expect +OK
+
+	// 3. Send PSYNC
+	conn.Write([]byte("*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n"))
+	r.ReadString('\n') // Expect +FULLRESYNC
 }
 
 func handleConnection(conn net.Conn) {
@@ -167,131 +194,16 @@ func handleConnection(conn net.Conn) {
 
 			case "INFO":
 				if len(parts) == 2 && strings.ToLower(parts[1]) == "replication" {
-					var info strings.Builder
 					role := "master"
 					if isReplica {
 						role = "slave"
 					}
-					info.WriteString(fmt.Sprintf("role:%s\r\n", role))
-					if !isReplica {
-						info.WriteString(fmt.Sprintf("master_replid:%s\r\n", masterReplId))
-						info.WriteString(fmt.Sprintf("master_repl_offset:%d\r\n", masterReplOffset))
-					}
-					resp := fmt.Sprintf("$%d\r\n%s\r\n", info.Len(), info.String())
+					info := fmt.Sprintf("role:%s", role)
+					resp := fmt.Sprintf("$%d\r\n%s\r\n", len(info), info)
 					conn.Write([]byte(resp))
 				} else {
 					conn.Write([]byte("-ERR only INFO replication is supported\r\n"))
 				}
-				case "REPLCONF":
-	// Just acknowledge REPLCONF commands
-	conn.Write([]byte("+OK\r\n"))
-
-case "PSYNC":
-	if len(parts) == 3 {
-		// Full resync response
-		resp := fmt.Sprintf("+FULLRESYNC %s %d\r\n", masterReplId, masterReplOffset)
-		conn.Write([]byte(resp))
-
-		// Send RDB snapshot in RESP format (simplified)
-		var rdb strings.Builderpackage main
-
-import (
-	"bufio"
-	"flag"
-	"fmt"
-	"net"
-	"os"
-	"strconv"
-	"strings"
-	"sync"
-	"time"
-)
-
-type entry struct {
-	value    string
-	expireAt time.Time
-}
-
-var store = make(map[string]entry)
-var mu sync.RWMutex
-
-var configDir string
-var configFilename string
-var isReplica bool
-var masterReplId = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb"
-var masterReplOffset = 0
-
-func main() {
-	dirFlag := flag.String("dir", ".", "Directory for RDB file")
-	fileFlag := flag.String("dbfilename", "dump.rdb", "RDB file name")
-	portFlag := flag.Int("port", 6379, "Port number to run the server on")
-	replicaFlag := flag.String("replicaof", "", "Replica of host:port (e.g., 'localhost 6379')")
-
-	flag.Parse()
-
-	configDir = *dirFlag
-	configFilename = *fileFlag
-	isReplica = *replicaFlag != ""
-
-	rdbPath := configDir + "/" + configFilename
-	loadRDB(rdbPath)
-
-	if isReplica {
-		go startReplica(*replicaFlag, *portFlag)
-	}
-
-	addr := fmt.Sprintf("0.0.0.0:%d", *portFlag)
-	l, err := net.Listen("tcp", addr)
-	if err != nil {
-		fmt.Printf("Failed to bind to port %d\n", *portFlag)
-		os.Exit(1)
-	}
-
-	for {
-		conn, err := l.Accept()
-		if err != nil {
-			fmt.Println("Connection error:", err)
-			continue
-		}
-		go handleConnection(conn)
-	}
-}
-
-func startReplica(masterAddr string, replicaPort int) {
-	conn, err := net.Dial("tcp", masterAddr)
-	if err != nil {
-		fmt.Println("Replica dial error:", err)
-		return
-	}
-	defer conn.Close()
-	r := bufio.NewReader(conn)
-
-	// 1. Send PING
-	conn.Write([]byte("*1\r\n$4\r\nPING\r\n"))
-	r.ReadString('\n') // Expect +PONG
-
-	// 2. Send REPLCONF with port
-	portStr := strconv.Itoa(replicaPort)
-	conn.Write([]byte(fmt.Sprintf("*3\r\n$8\r\nREPLCONF\r\n$4\r\nport\r\n$%d\r\n%s\r\n", len(portStr), portStr)))
-	r.ReadString('\n') // Expect +OK
-
-	// 3. Send PSYNC
-	conn.Write([]byte("*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n"))
-	r.ReadString('\n') // Expect +FULLRESYNC
-}
-
-// ... (keep rest of your handleConnection and utility functions unchanged)
-
-		mu.RLock()
-		rdb.WriteString(fmt.Sprintf("$%d\r\n", len(store)))
-		for k, v := range store {
-			rdb.WriteString(fmt.Sprintf("*2\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
-				len(k), k, len(v.value), v.value))
-		}
-		mu.RUnlock()
-		conn.Write([]byte(rdb.String()))
-	}
-
 
 			default:
 				conn.Write([]byte("-ERR unknown command\r\n"))
@@ -300,9 +212,11 @@ func startReplica(masterAddr string, replicaPort int) {
 	}
 }
 
+// Read RDB file and populate store
 func loadRDB(path string) {
 	file, err := os.Open(path)
 	if err != nil {
+		// File doesn't exist
 		return
 	}
 	defer file.Close()
@@ -323,11 +237,14 @@ func loadRDB(path string) {
 		if prefix == 0xFA {
 			_, _ = readString(reader)
 			_, _ = readString(reader)
+
 		} else if prefix == 0xFE {
 			_, _ = readLength(reader)
+
 		} else if prefix == 0xFB {
 			_, _ = readLength(reader)
 			_, _ = readLength(reader)
+
 		} else if prefix == 0xFC || prefix == 0xFD {
 			var expireAt time.Time
 			if prefix == 0xFD {
@@ -351,18 +268,21 @@ func loadRDB(path string) {
 			mu.Lock()
 			store[key] = entry{value: val, expireAt: expireAt}
 			mu.Unlock()
+
 		} else if prefix == 0x00 {
 			key, _ := readString(reader)
 			val, _ := readString(reader)
 			mu.Lock()
 			store[key] = entry{value: val}
 			mu.Unlock()
+
 		} else if prefix == 0xFF {
 			break
 		}
 	}
 }
 
+// Helpers
 func readLength(r *bufio.Reader) (int, error) {
 	b, err := r.ReadByte()
 	if err != nil {
