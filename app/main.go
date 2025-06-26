@@ -23,6 +23,8 @@ var mu sync.RWMutex
 var configDir string
 var configFilename string
 var isReplica bool
+var masterReplId = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb"
+var masterReplOffset = 0
 
 func main() {
 	dirFlag := flag.String("dir", ".", "Directory for RDB file")
@@ -165,12 +167,17 @@ func handleConnection(conn net.Conn) {
 
 			case "INFO":
 				if len(parts) == 2 && strings.ToLower(parts[1]) == "replication" {
+					var info strings.Builder
 					role := "master"
 					if isReplica {
 						role = "slave"
 					}
-					info := fmt.Sprintf("role:%s", role)
-					resp := fmt.Sprintf("$%d\r\n%s\r\n", len(info), info)
+					info.WriteString(fmt.Sprintf("role:%s\r\n", role))
+					if !isReplica {
+						info.WriteString(fmt.Sprintf("master_replid:%s\r\n", masterReplId))
+						info.WriteString(fmt.Sprintf("master_repl_offset:%d\r\n", masterReplOffset))
+					}
+					resp := fmt.Sprintf("$%d\r\n%s", info.Len(), info.String())
 					conn.Write([]byte(resp))
 				} else {
 					conn.Write([]byte("-ERR only INFO replication is supported\r\n"))
@@ -183,11 +190,9 @@ func handleConnection(conn net.Conn) {
 	}
 }
 
-// Read RDB file and populate store
 func loadRDB(path string) {
 	file, err := os.Open(path)
 	if err != nil {
-		// File doesn't exist
 		return
 	}
 	defer file.Close()
@@ -208,14 +213,11 @@ func loadRDB(path string) {
 		if prefix == 0xFA {
 			_, _ = readString(reader)
 			_, _ = readString(reader)
-
 		} else if prefix == 0xFE {
 			_, _ = readLength(reader)
-
 		} else if prefix == 0xFB {
 			_, _ = readLength(reader)
 			_, _ = readLength(reader)
-
 		} else if prefix == 0xFC || prefix == 0xFD {
 			var expireAt time.Time
 			if prefix == 0xFD {
@@ -239,21 +241,18 @@ func loadRDB(path string) {
 			mu.Lock()
 			store[key] = entry{value: val, expireAt: expireAt}
 			mu.Unlock()
-
 		} else if prefix == 0x00 {
 			key, _ := readString(reader)
 			val, _ := readString(reader)
 			mu.Lock()
 			store[key] = entry{value: val}
 			mu.Unlock()
-
 		} else if prefix == 0xFF {
 			break
 		}
 	}
 }
 
-// Helpers
 func readLength(r *bufio.Reader) (int, error) {
 	b, err := r.ReadByte()
 	if err != nil {
