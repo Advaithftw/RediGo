@@ -42,7 +42,14 @@ func main() {
 	loadRDB(rdbPath)
 
 	if isReplica {
-		go startReplica(*replicaFlag, *portFlag)
+		parts := strings.Fields(*replicaFlag)
+		if len(parts) == 2 {
+			masterHost := parts[0]
+			masterPort := parts[1]
+			go startReplica(fmt.Sprintf("%s:%s", masterHost, masterPort), *portFlag)
+		} else {
+			fmt.Println("Invalid replicaof format. Use: host port")
+		}
 	}
 
 	addr := fmt.Sprintf("0.0.0.0:%d", *portFlag)
