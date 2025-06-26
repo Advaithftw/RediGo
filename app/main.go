@@ -177,7 +177,7 @@ func handleConnection(conn net.Conn) {
 						info.WriteString(fmt.Sprintf("master_replid:%s\r\n", masterReplId))
 						info.WriteString(fmt.Sprintf("master_repl_offset:%d\r\n", masterReplOffset))
 					}
-					resp := fmt.Sprintf("$%d\r\n%s", info.Len(), info.String())
+					resp := fmt.Sprintf("$%d\r\n%s\r\n", info.Len(), info.String())
 					conn.Write([]byte(resp))
 				} else {
 					conn.Write([]byte("-ERR only INFO replication is supported\r\n"))
