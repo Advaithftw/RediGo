@@ -1,13 +1,16 @@
+
 package main
 
 import (
 	"bufio"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
-	"strings"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -20,18 +23,19 @@ type entry struct {
 var store = make(map[string]entry)
 var mu sync.RWMutex
 
-// New: variables to hold config values
 var configDir string
 var configFilename string
 
 func main() {
-	// New: Parse flags from CLI
+	// Parse CLI arguments
 	dirFlag := flag.String("dir", ".", "Directory for RDB file")
 	fileFlag := flag.String("dbfilename", "dump.rdb", "RDB file name")
 	flag.Parse()
 
 	configDir = *dirFlag
 	configFilename = *fileFlag
+
+	loadRDB(filepath.Join(configDir, configFilename)) // Load RDB file at startup
 
 	l, err := net.Listen("tcp", "0.0.0.0:6379")
 	if err != nil {
@@ -65,10 +69,7 @@ func handleConnection(conn net.Conn) {
 			parts := make([]string, 0, numArgs)
 
 			for i := 0; i < numArgs; i++ {
-				_, err := reader.ReadString('\n') // skip $<len>
-				if err != nil {
-					return
-				}
+				_, _ = reader.ReadString('\n') // Skip $<len>
 				arg, err := reader.ReadString('\n')
 				if err != nil {
 					return
@@ -132,16 +133,31 @@ func handleConnection(conn net.Conn) {
 					} else if param == "dbfilename" {
 						value = configFilename
 					} else {
-						conn.Write([]byte("*0\r\n")) // Empty array if unknown
+						conn.Write([]byte("*0\r\n"))
 						continue
 					}
-					// RESP Array: *2\r\n$<len>\r\n<key>\r\n$<len>\r\n<value>\r\n
 					resp := fmt.Sprintf("*2\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
-						len(param), param,
-						len(value), value)
+						len(param), param, len(value), value)
 					conn.Write([]byte(resp))
 				} else {
 					conn.Write([]byte("-ERR unknown CONFIG command\r\n"))
+				}
+
+			case "KEYS":
+				if len(parts) == 2 && parts[1] == "*" {
+					mu.RLock()
+					keys := make([]string, 0, len(store))
+					for k := range store {
+						keys = append(keys, k)
+					}
+					mu.RUnlock()
+					resp := fmt.Sprintf("*%d\r\n", len(keys))
+					for _, k := range keys {
+						resp += fmt.Sprintf("$%d\r\n%s\r\n", len(k), k)
+					}
+					conn.Write([]byte(resp))
+				} else {
+					conn.Write([]byte("*0\r\n"))
 				}
 
 			default:
@@ -149,4 +165,50 @@ func handleConnection(conn net.Conn) {
 			}
 		}
 	}
+}
+
+func loadRDB(path string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	header := make([]byte, 9)
+	if _, err := io.ReadFull(f, header); err != nil {
+		return
+	}
+	if !strings.HasPrefix(string(header), "REDIS") {
+		return
+	}
+
+	for {
+		t := make([]byte, 1)
+		if _, err := f.Read(t); err != nil {
+			break
+		}
+		if t[0] == 0xFE || t[0] == 0xFF {
+			break
+		}
+		if t[0] == 0 { // type 0 = string
+			keyLen := readLength(f)
+			key := make([]byte, keyLen)
+			f.Read(key)
+
+			valLen := readLength(f)
+			val := make([]byte, valLen)
+			f.Read(val)
+
+			mu.Lock()
+			store[string(key)] = entry{value: string(val)}
+			mu.Unlock()
+			break
+		}
+	}
+}
+
+func readLength(r io.Reader) int {
+	b := make([]byte, 1)
+	r.Read(b)
+	return int(b[0])
 }
