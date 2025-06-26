@@ -159,6 +159,14 @@ func handleConnection(conn net.Conn) {
 				} else {
 					conn.Write([]byte("*0\r\n"))
 				}
+			case "INFO":
+		if len(parts) == 2 && strings.ToLower(parts[1]) == "replication" {
+			info := "role:master"
+			resp := fmt.Sprintf("$%d\r\n%s\r\n", len(info), info)
+			conn.Write([]byte(resp))
+		} else {
+			conn.Write([]byte("-ERR only INFO replication is supported\r\n"))
+		}
 
 			default:
 				conn.Write([]byte("-ERR unknown command\r\n"))
