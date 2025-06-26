@@ -143,21 +143,24 @@ func handleConnection(conn net.Conn) {
 				}
 
 			case "KEYS":
-				if len(parts) == 2 && parts[1] == "*" {
-					mu.RLock()
-					keys := make([]string, 0, len(store))
-					for k := range store {
-						keys = append(keys, k)
-					}
-					mu.RUnlock()
-					resp := fmt.Sprintf("*%d\r\n", len(keys))
-					for _, k := range keys {
-						resp += fmt.Sprintf("$%d\r\n%s\r\n", len(k), k)
-					}
-					conn.Write([]byte(resp))
-				} else {
-					conn.Write([]byte("*0\r\n"))
-				}
+    if len(parts) == 2 && parts[1] == "*" {
+        mu.RLock()
+        keys := make([]string, 0, len(store))
+        now := time.Now()
+        for k, e := range store {
+            if e.expireAt.IsZero() || now.Before(e.expireAt) {
+                keys = append(keys, k)
+            }
+        }
+        mu.RUnlock()
+        resp := fmt.Sprintf("*%d\r\n", len(keys))
+        for _, k := range keys {
+            resp += fmt.Sprintf("$%d\r\n%s\r\n", len(k), k)
+        }
+        conn.Write([]byte(resp))
+    } else {
+        conn.Write([]byte("*0\r\n"))
+    }
 
 			default:
 				conn.Write([]byte("-ERR unknown command\r\n"))
