@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"encoding/binary"
 )
 
 type entry struct {
@@ -204,28 +205,26 @@ func loadRDB(path string) {
 	}
 }
 
-func readLength(r io.Reader) (int, error) {
+func readLength(r io.Reader) int {
 	b := make([]byte, 1)
-	if _, err := r.Read(b); err != nil {
-		return 0, err
-	}
-	first := b[0]
-	prefix := (first & 0xC0) >> 6
+	r.Read(b)
+	prefix := (b[0] & 0xC0) >> 6
 
-	if prefix == 0 { 
-		return int(first & 0x3F), nil
-	} else if prefix == 1 { 
+	switch prefix {
+	case 0:
+		// 6-bit length
+		return int(b[0] & 0x3F)
+	case 1:
+		// 14-bit length
 		b2 := make([]byte, 1)
-		if _, err := r.Read(b2); err != nil {
-			return 0, err
-		}
-		return int(first&0x3F)<<8 | int(b2[0]), nil
-	} else if prefix == 2 { 
+		r.Read(b2)
+		return int(b[0]&0x3F)<<8 | int(b2[0])
+	case 2:
+		// 32-bit length
 		b4 := make([]byte, 4)
-		if _, err := r.Read(b4); err != nil {
-			return 0, err
-		}
-		return int(b4[0]) | int(b4[1])<<8 | int(b4[2])<<16 | int(b4[3])<<24, nil
+		r.Read(b4)
+		return int(binary.BigEndian.Uint32(b4))
+	default:
+		return 0
 	}
-	return 0, fmt.Errorf("unsupported length encoding")
 }
