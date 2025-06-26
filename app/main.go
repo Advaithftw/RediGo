@@ -200,17 +200,20 @@ func handleConnection(conn net.Conn) {
 				}
 
 			case "INFO":
-				if len(parts) == 2 && strings.ToLower(parts[1]) == "replication" {
-					role := "master"
-					if isReplica {
-						role = "slave"
-					}
-					info := fmt.Sprintf("role:%s", role)
-					resp := fmt.Sprintf("$%d\r\n%s\r\n", len(info), info)
-					conn.Write([]byte(resp))
-				} else {
-					conn.Write([]byte("-ERR only INFO replication is supported\r\n"))
-				}
+	if len(parts) == 2 && strings.ToLower(parts[1]) == "replication" {
+		var info strings.Builder
+		role := "master"
+		if isReplica {
+			role = "slave"
+		}
+		info.WriteString(fmt.Sprintf("role:%s\r\n", role))
+		if !isReplica {
+			info.WriteString(fmt.Sprintf("master_replid:%s\r\n", masterReplId))
+			info.WriteString(fmt.Sprintf("master_repl_offset:%d\r\n", masterReplOffset))
+		}
+		resp := fmt.Sprintf("$%d\r\n%s\r\n", info.Len(), info.String())
+		conn.Write([]byte(resp))
+	}
 
 			default:
 				conn.Write([]byte("-ERR unknown command\r\n"))
