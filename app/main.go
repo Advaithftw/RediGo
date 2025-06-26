@@ -190,11 +190,11 @@ func loadRDB(path string) {
 			break
 		}
 		if t[0] == 0 {
-			keyLen, _ := readLength(f)
+			keyLen := readLength(f)
 			key := make([]byte, keyLen)
 			f.Read(key)
 
-			valLen, _ := readLength(f)
+			valLen := readLength(f)
 			val := make([]byte, valLen)
 			f.Read(val)
 
