@@ -4,15 +4,12 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
-	"io"
 	"net"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-	"encoding/binary"
 )
 
 type entry struct {
@@ -34,7 +31,9 @@ func main() {
 	configDir = *dirFlag
 	configFilename = *fileFlag
 
-	loadRDB(filepath.Join(configDir, configFilename))
+	// Load RDB file on startup
+	rdbPath := configDir + "/" + configFilename
+	loadRDB(rdbPath)
 
 	l, err := net.Listen("tcp", "0.0.0.0:6379")
 	if err != nil {
@@ -68,7 +67,10 @@ func handleConnection(conn net.Conn) {
 			parts := make([]string, 0, numArgs)
 
 			for i := 0; i < numArgs; i++ {
-				_, _ = reader.ReadString('\n') // skip $<len>
+				_, err := reader.ReadString('\n') // skip $<len>
+				if err != nil {
+					return
+				}
 				arg, err := reader.ReadString('\n')
 				if err != nil {
 					return
@@ -143,24 +145,18 @@ func handleConnection(conn net.Conn) {
 				}
 
 			case "KEYS":
-    if len(parts) == 2 && parts[1] == "*" {
-        mu.RLock()
-        keys := make([]string, 0, len(store))
-        now := time.Now()
-        for k, e := range store {
-            if e.expireAt.IsZero() || now.Before(e.expireAt) {
-                keys = append(keys, k)
-            }
-        }
-        mu.RUnlock()
-        resp := fmt.Sprintf("*%d\r\n", len(keys))
-        for _, k := range keys {
-            resp += fmt.Sprintf("$%d\r\n%s\r\n", len(k), k)
-        }
-        conn.Write([]byte(resp))
-    } else {
-        conn.Write([]byte("*0\r\n"))
-    }
+				if len(parts) == 2 && parts[1] == "*" {
+					mu.RLock()
+					var resp strings.Builder
+					resp.WriteString(fmt.Sprintf("*%d\r\n", len(store)))
+					for k := range store {
+						resp.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(k), k))
+					}
+					mu.RUnlock()
+					conn.Write([]byte(resp.String()))
+				} else {
+					conn.Write([]byte("*0\r\n"))
+				}
 
 			default:
 				conn.Write([]byte("-ERR unknown command\r\n"))
@@ -169,65 +165,110 @@ func handleConnection(conn net.Conn) {
 	}
 }
 
+// Read RDB file and populate store
 func loadRDB(path string) {
-	f, err := os.Open(path)
+	file, err := os.Open(path)
 	if err != nil {
+		// File doesn't exist
 		return
 	}
-	defer f.Close()
+	defer file.Close()
+	reader := bufio.NewReader(file)
 
+	// Skip 9-byte header: "REDIS0011"
 	header := make([]byte, 9)
-	if _, err := io.ReadFull(f, header); err != nil {
-		return
-	}
-	if !strings.HasPrefix(string(header), "REDIS") {
+	_, err = reader.Read(header)
+	if err != nil || string(header[:5]) != "REDIS" {
 		return
 	}
 
 	for {
-		t := make([]byte, 1)
-		if _, err := f.Read(t); err != nil {
+		prefix, err := reader.ReadByte()
+		if err != nil {
 			break
 		}
-		if t[0] == 0xFE || t[0] == 0xFF {
-			break
-		}
-		if t[0] == 0 {
-			keyLen := readLength(f)
-			key := make([]byte, keyLen)
-			f.Read(key)
 
-			valLen := readLength(f)
-			val := make([]byte, valLen)
-			f.Read(val)
+		if prefix == 0xFA {
+			_, _ = readString(reader) // metadata key
+			_, _ = readString(reader) // metadata val
 
+		} else if prefix == 0xFE {
+			_, _ = readLength(reader) // DB selector
+
+		} else if prefix == 0xFB {
+			_, _ = readLength(reader) // hash table size
+			_, _ = readLength(reader) // expires table size
+
+		} else if prefix == 0xFC || prefix == 0xFD {
+			var expireAt time.Time
+			if prefix == 0xFD {
+				t := make([]byte, 4)
+				reader.Read(t)
+				sec := int64(t[0]) | int64(t[1])<<8 | int64(t[2])<<16 | int64(t[3])<<24
+				expireAt = time.Unix(sec, 0)
+			} else {
+				t := make([]byte, 8)
+				reader.Read(t)
+				ms := int64(t[0]) | int64(t[1])<<8 | int64(t[2])<<16 | int64(t[3])<<24 |
+					int64(t[4])<<32 | int64(t[5])<<40 | int64(t[6])<<48 | int64(t[7])<<56
+				expireAt = time.UnixMilli(ms)
+			}
+			typ, _ := reader.ReadByte()
+			if typ != 0x00 {
+				continue
+			}
+			key, _ := readString(reader)
+			val, _ := readString(reader)
 			mu.Lock()
-			store[string(key)] = entry{value: string(val)}
+			store[key] = entry{value: val, expireAt: expireAt}
 			mu.Unlock()
+
+		} else if prefix == 0x00 {
+			key, _ := readString(reader)
+			val, _ := readString(reader)
+			mu.Lock()
+			store[key] = entry{value: val}
+			mu.Unlock()
+
+		} else if prefix == 0xFF {
+			break
 		}
 	}
 }
 
-func readLength(r io.Reader) int {
-	b := make([]byte, 1)
-	r.Read(b)
-	prefix := (b[0] & 0xC0) >> 6
-
-	switch prefix {
-	case 0:
-		// 6-bit length
-		return int(b[0] & 0x3F)
-	case 1:
-		// 14-bit length
-		b2 := make([]byte, 1)
-		r.Read(b2)
-		return int(b[0]&0x3F)<<8 | int(b2[0])
-	case 2:
-		// 32-bit length
-		b4 := make([]byte, 4)
-		r.Read(b4)
-		return int(binary.BigEndian.Uint32(b4))
-	default:
-		return 0
+// Helpers for RDB parsing
+func readLength(r *bufio.Reader) (int, error) {
+	b, err := r.ReadByte()
+	if err != nil {
+		return 0, err
 	}
+	switch b >> 6 {
+	case 0:
+		return int(b & 0x3F), nil
+	case 1:
+		b2, err := r.ReadByte()
+		if err != nil {
+			return 0, err
+		}
+		return int(b&0x3F)<<8 | int(b2), nil
+	case 2:
+		bytes := make([]byte, 4)
+		_, err := r.Read(bytes)
+		if err != nil {
+			return 0, err
+		}
+		return int(bytes[0])<<24 | int(bytes[1])<<16 | int(bytes[2])<<8 | int(bytes[3]), nil
+	default:
+		return 0, fmt.Errorf("unsupported length encoding")
+	}
+}
+
+func readString(r *bufio.Reader) (string, error) {
+	length, err := readLength(r)
+	if err != nil {
+		return "", err
+	}
+	buf := make([]byte, length)
+	_, err = r.Read(buf)
+	return string(buf), err
 }
