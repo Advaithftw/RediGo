@@ -26,6 +26,7 @@ var configFilename string
 func main() {
 	dirFlag := flag.String("dir", ".", "Directory for RDB file")
 	fileFlag := flag.String("dbfilename", "dump.rdb", "RDB file name")
+	portFlag := flag.Int("port", 6379, "Port number to run the server on")
 	flag.Parse()
 
 	configDir = *dirFlag
@@ -35,9 +36,10 @@ func main() {
 	rdbPath := configDir + "/" + configFilename
 	loadRDB(rdbPath)
 
-	l, err := net.Listen("tcp", "0.0.0.0:6379")
+	addr := fmt.Sprintf("0.0.0.0:%d", *portFlag)
+	l, err := net.Listen("tcp", addr)
 	if err != nil {
-		fmt.Println("Failed to bind to port 6379")
+		fmt.Printf("Failed to bind to port %d\n", *portFlag)
 		os.Exit(1)
 	}
 
