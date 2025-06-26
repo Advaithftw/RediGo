@@ -22,17 +22,20 @@ var mu sync.RWMutex
 
 var configDir string
 var configFilename string
+var isReplica bool
 
 func main() {
 	dirFlag := flag.String("dir", ".", "Directory for RDB file")
 	fileFlag := flag.String("dbfilename", "dump.rdb", "RDB file name")
 	portFlag := flag.Int("port", 6379, "Port number to run the server on")
+	replicaFlag := flag.String("replicaof", "", "Replica of host:port (e.g., 'localhost 6379')")
+
 	flag.Parse()
 
 	configDir = *dirFlag
 	configFilename = *fileFlag
+	isReplica = *replicaFlag != ""
 
-	// Load RDB file on startup
 	rdbPath := configDir + "/" + configFilename
 	loadRDB(rdbPath)
 
@@ -159,14 +162,19 @@ func handleConnection(conn net.Conn) {
 				} else {
 					conn.Write([]byte("*0\r\n"))
 				}
+
 			case "INFO":
-		if len(parts) == 2 && strings.ToLower(parts[1]) == "replication" {
-			info := "role:master"
-			resp := fmt.Sprintf("$%d\r\n%s\r\n", len(info), info)
-			conn.Write([]byte(resp))
-		} else {
-			conn.Write([]byte("-ERR only INFO replication is supported\r\n"))
-		}
+				if len(parts) == 2 && strings.ToLower(parts[1]) == "replication" {
+					role := "master"
+					if isReplica {
+						role = "slave"
+					}
+					info := fmt.Sprintf("role:%s", role)
+					resp := fmt.Sprintf("$%d\r\n%s\r\n", len(info), info)
+					conn.Write([]byte(resp))
+				} else {
+					conn.Write([]byte("-ERR only INFO replication is supported\r\n"))
+				}
 
 			default:
 				conn.Write([]byte("-ERR unknown command\r\n"))
@@ -185,7 +193,6 @@ func loadRDB(path string) {
 	defer file.Close()
 	reader := bufio.NewReader(file)
 
-	// Skip 9-byte header: "REDIS0011"
 	header := make([]byte, 9)
 	_, err = reader.Read(header)
 	if err != nil || string(header[:5]) != "REDIS" {
@@ -199,15 +206,15 @@ func loadRDB(path string) {
 		}
 
 		if prefix == 0xFA {
-			_, _ = readString(reader) // metadata key
-			_, _ = readString(reader) // metadata val
+			_, _ = readString(reader)
+			_, _ = readString(reader)
 
 		} else if prefix == 0xFE {
-			_, _ = readLength(reader) // DB selector
+			_, _ = readLength(reader)
 
 		} else if prefix == 0xFB {
-			_, _ = readLength(reader) // hash table size
-			_, _ = readLength(reader) // expires table size
+			_, _ = readLength(reader)
+			_, _ = readLength(reader)
 
 		} else if prefix == 0xFC || prefix == 0xFD {
 			var expireAt time.Time
@@ -246,7 +253,7 @@ func loadRDB(path string) {
 	}
 }
 
-// Helpers for RDB parsing
+// Helpers
 func readLength(r *bufio.Reader) (int, error) {
 	b, err := r.ReadByte()
 	if err != nil {
