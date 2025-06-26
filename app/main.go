@@ -1,4 +1,3 @@
-
 package main
 
 import (
@@ -27,7 +26,6 @@ var configDir string
 var configFilename string
 
 func main() {
-	// Parse CLI arguments
 	dirFlag := flag.String("dir", ".", "Directory for RDB file")
 	fileFlag := flag.String("dbfilename", "dump.rdb", "RDB file name")
 	flag.Parse()
@@ -35,7 +33,7 @@ func main() {
 	configDir = *dirFlag
 	configFilename = *fileFlag
 
-	loadRDB(filepath.Join(configDir, configFilename)) // Load RDB file at startup
+	loadRDB(filepath.Join(configDir, configFilename))
 
 	l, err := net.Listen("tcp", "0.0.0.0:6379")
 	if err != nil {
@@ -69,7 +67,7 @@ func handleConnection(conn net.Conn) {
 			parts := make([]string, 0, numArgs)
 
 			for i := 0; i < numArgs; i++ {
-				_, _ = reader.ReadString('\n') // Skip $<len>
+				_, _ = reader.ReadString('\n') // skip $<len>
 				arg, err := reader.ReadString('\n')
 				if err != nil {
 					return
@@ -190,25 +188,44 @@ func loadRDB(path string) {
 		if t[0] == 0xFE || t[0] == 0xFF {
 			break
 		}
-		if t[0] == 0 { // type 0 = string
-			keyLen := readLength(f)
+		if t[0] == 0 {
+			keyLen, _ := readLength(f)
 			key := make([]byte, keyLen)
 			f.Read(key)
 
-			valLen := readLength(f)
+			valLen, _ := readLength(f)
 			val := make([]byte, valLen)
 			f.Read(val)
 
 			mu.Lock()
 			store[string(key)] = entry{value: string(val)}
 			mu.Unlock()
-			break
 		}
 	}
 }
 
-func readLength(r io.Reader) int {
+func readLength(r io.Reader) (int, error) {
 	b := make([]byte, 1)
-	r.Read(b)
-	return int(b[0])
+	if _, err := r.Read(b); err != nil {
+		return 0, err
+	}
+	first := b[0]
+	prefix := (first & 0xC0) >> 6
+
+	if prefix == 0 { 
+		return int(first & 0x3F), nil
+	} else if prefix == 1 { 
+		b2 := make([]byte, 1)
+		if _, err := r.Read(b2); err != nil {
+			return 0, err
+		}
+		return int(first&0x3F)<<8 | int(b2[0]), nil
+	} else if prefix == 2 { 
+		b4 := make([]byte, 4)
+		if _, err := r.Read(b4); err != nil {
+			return 0, err
+		}
+		return int(b4[0]) | int(b4[1])<<8 | int(b4[2])<<16 | int(b4[3])<<24, nil
+	}
+	return 0, fmt.Errorf("unsupported length encoding")
 }
