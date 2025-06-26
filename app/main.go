@@ -193,7 +193,95 @@ case "PSYNC":
 		conn.Write([]byte(resp))
 
 		// Send RDB snapshot in RESP format (simplified)
-		var rdb strings.Builder
+		var rdb strings.Builderpackage main
+
+import (
+	"bufio"
+	"flag"
+	"fmt"
+	"net"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+type entry struct {
+	value    string
+	expireAt time.Time
+}
+
+var store = make(map[string]entry)
+var mu sync.RWMutex
+
+var configDir string
+var configFilename string
+var isReplica bool
+var masterReplId = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb"
+var masterReplOffset = 0
+
+func main() {
+	dirFlag := flag.String("dir", ".", "Directory for RDB file")
+	fileFlag := flag.String("dbfilename", "dump.rdb", "RDB file name")
+	portFlag := flag.Int("port", 6379, "Port number to run the server on")
+	replicaFlag := flag.String("replicaof", "", "Replica of host:port (e.g., 'localhost 6379')")
+
+	flag.Parse()
+
+	configDir = *dirFlag
+	configFilename = *fileFlag
+	isReplica = *replicaFlag != ""
+
+	rdbPath := configDir + "/" + configFilename
+	loadRDB(rdbPath)
+
+	if isReplica {
+		go startReplica(*replicaFlag, *portFlag)
+	}
+
+	addr := fmt.Sprintf("0.0.0.0:%d", *portFlag)
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		fmt.Printf("Failed to bind to port %d\n", *portFlag)
+		os.Exit(1)
+	}
+
+	for {
+		conn, err := l.Accept()
+		if err != nil {
+			fmt.Println("Connection error:", err)
+			continue
+		}
+		go handleConnection(conn)
+	}
+}
+
+func startReplica(masterAddr string, replicaPort int) {
+	conn, err := net.Dial("tcp", masterAddr)
+	if err != nil {
+		fmt.Println("Replica dial error:", err)
+		return
+	}
+	defer conn.Close()
+	r := bufio.NewReader(conn)
+
+	// 1. Send PING
+	conn.Write([]byte("*1\r\n$4\r\nPING\r\n"))
+	r.ReadString('\n') // Expect +PONG
+
+	// 2. Send REPLCONF with port
+	portStr := strconv.Itoa(replicaPort)
+	conn.Write([]byte(fmt.Sprintf("*3\r\n$8\r\nREPLCONF\r\n$4\r\nport\r\n$%d\r\n%s\r\n", len(portStr), portStr)))
+	r.ReadString('\n') // Expect +OK
+
+	// 3. Send PSYNC
+	conn.Write([]byte("*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n"))
+	r.ReadString('\n') // Expect +FULLRESYNC
+}
+
+// ... (keep rest of your handleConnection and utility functions unchanged)
+
 		mu.RLock()
 		rdb.WriteString(fmt.Sprintf("$%d\r\n", len(store)))
 		for k, v := range store {
