@@ -417,7 +417,6 @@ func waitForReplicas(numReplicas int, timeoutMs int) int {
 		return 0
 	}
 
-	// If no replicas are needed, return immediately
 	if numReplicas <= 0 {
 		return len(replicas)
 	}
@@ -442,36 +441,30 @@ func waitForReplicas(numReplicas int, timeoutMs int) int {
 		go func(r *replicaConnection) {
 			r.mu.Lock()
 			defer r.mu.Unlock()
-			
+
 			// Set a read deadline
 			r.conn.SetReadDeadline(time.Now().Add(time.Duration(timeoutMs) * time.Millisecond))
-			defer r.conn.SetReadDeadline(time.Time{}) // Clear deadline
-			
-			// Read the ACK response
-			line, err := r.reader.ReadString('\n')
-			if err != nil {
-				return
-			}
-			
-			if strings.HasPrefix(strings.TrimSpace(line), "*3") {
-				// Read the REPLCONF part
-				r.reader.ReadString('\n') // $8
-				r.reader.ReadString('\n') // REPLCONF
-				
-				// Read the ACK part
-				r.reader.ReadString('\n') // $3
-				ackCmd, _ := r.reader.ReadString('\n')
-				
-				if strings.TrimSpace(ackCmd) == "ACK" {
-					// Read the offset
-					r.reader.ReadString('\n') // $<len>
-					r.reader.ReadString('\n') // offset value
-					
-					// Signal that we got an ACK
+			defer r.conn.SetReadDeadline(time.Time{})
+
+			// Create a new bufio.Reader to ensure clean state
+			reader := bufio.NewReader(r.conn)
+
+			// Read until we find an ACK response
+			for {
+				line, err := reader.ReadString('\n')
+				if err != nil {
+					fmt.Printf("Error reading from replica: %v\n", err)
+					return
+				}
+
+				// Look for the ACK command in the response
+				if strings.Contains(line, "ACK") {
 					select {
 					case ackChan <- struct{}{}:
+						fmt.Println("ACK received from replica")
 					default:
 					}
+					return
 				}
 			}
 		}(replica)
@@ -487,6 +480,7 @@ func waitForReplicas(numReplicas int, timeoutMs int) int {
 				return ackCount
 			}
 		case <-timeout:
+			fmt.Printf("Timeout reached, received %d ACKs\n", ackCount)
 			return ackCount
 		}
 	}
