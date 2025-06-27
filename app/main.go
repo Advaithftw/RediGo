@@ -410,95 +410,92 @@ func handleConnection(conn net.Conn) {
 
 
 
+
 func waitForReplicas(numReplicas int, timeoutMs int) int {
-	replicaMu.Lock()
-	replicas := make([]*replicaConnection, len(replicaConnections))
-	copy(replicas, replicaConnections)
-	replicaMu.Unlock()
+    replicaMu.Lock()
+    replicas := make([]*replicaConnection, len(replicaConnections))
+    copy(replicas, replicaConnections)
+    replicaMu.Unlock()
 
-	if len(replicas) == 0 {
-		return 0
-	}
+    if len(replicas) == 0 {
+        return 0
+    }
 
-	if numReplicas <= 0 {
-		return len(replicas)
-	}
+    if numReplicas <= 0 {
+        return len(replicas)
+    }
 
-	// Log timeout for debugging
-	fmt.Printf("waitForReplicas called with timeoutMs: %d, numReplicas: %d\n", timeoutMs, numReplicas)
+    fmt.Printf("waitForReplicas called with timeoutMs: %d, numReplicas: %d\n", timeoutMs, numReplicas)
 
-	// Send REPLCONF GETACK * to all replicas
-	getackCmd := "*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n"
-	ackChan := make(chan struct{}, len(replicas))
-	timeout := time.After(time.Duration(timeoutMs) * time.Millisecond)
+    // Send REPLCONF GETACK * to all replicas
+    getackCmd := "*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n"
+    ackChan := make(chan struct{}, len(replicas))
+    timeout := time.After(time.Duration(timeoutMs) * time.Millisecond)
 
-	for _, replica := range replicas {
-		go func(r *replicaConnection) {
-			r.mu.Lock()
-			defer r.mu.Unlock()
+    for _, replica := range replicas {
+        go func(r *replicaConnection) {
+            r.mu.Lock()
+            defer r.mu.Unlock()
 
-			// Write GETACK command
-			_, err := r.conn.Write([]byte(getackCmd))
-			if err != nil {
-				fmt.Printf("Error sending GETACK to replica: %v\n", err)
-				return
-			}
+            // Write GETACK command
+            _, err := r.conn.Write([]byte(getackCmd))
+            if err != nil {
+                fmt.Printf("Error sending GETACK to replica: %v\n", err)
+                return
+            }
 
-			// Set read deadline
-			if err := r.conn.SetReadDeadline(time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)); err != nil {
-				fmt.Printf("Error setting read deadline: %v\n", err)
-				return
-			}
-			defer r.conn.SetReadDeadline(time.Time{})
+            // Set read deadline
+            if err := r.conn.SetReadDeadline(time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)); err != nil {
+                fmt.Printf("Error setting read deadline: %v\n", err)
+                return
+            }
+            defer r.conn.SetReadDeadline(time.Time{})
 
-			// Create a new bufio.Reader
-			reader := bufio.NewReader(r.conn)
-			data := ""
+            // Read directly from the connection
+            buf := make([]byte, 1024)
+            data := ""
+            for {
+                n, err := r.conn.Read(buf)
+                if err != nil {
+                    if err == io.EOF || strings.Contains(err.Error(), "use of closed network connection") {
+                        fmt.Printf("Connection closed or EOF while reading from replica: %v, data so far: %q\n", err, data)
+                    } else if strings.Contains(err.Error(), "i/o timeout") {
+                        fmt.Printf("Read timeout from replica: %v, data so far: %q\n", err, data)
+                    } else {
+                        fmt.Printf("Error reading from replica: %v, data so far: %q\n", err, data)
+                    }
+                    return
+                }
 
-			// Read until ACK or error
-			buf := make([]byte, 1024)
-			for {
-				n, err := reader.Read(buf)
-				if err != nil {
-					if err == io.EOF || strings.Contains(err.Error(), "use of closed network connection") {
-						fmt.Printf("Connection closed or EOF while reading from replica: %v, data so far: %q\n", err, data)
-					} else if strings.Contains(err.Error(), "i/o timeout") {
-						fmt.Printf("Read timeout from replica: %v, data so far: %q\n", err, data)
-					} else {
-						fmt.Printf("Error reading from replica: %v, data so far: %q\n", err, data)
-					}
-					return
-				}
+                data += string(buf[:n])
+                fmt.Printf("Data received from replica: %q\n", string(buf[:n]))
+                if strings.Contains(data, "ACK") {
+                    fmt.Printf("ACK received from replica: %q\n", data)
+                    select {
+                    case ackChan <- struct{}{}:
+                    default:
+                    }
+                    return
+                }
+            }
+        }(replica)
+    }
 
-				data += string(buf[:n])
-				fmt.Printf("Data received from replica: %q\n", string(buf[:n]))
-				if strings.Contains(data, "ACK") {
-					fmt.Printf("ACK received from replica: %q\n", data)
-					select {
-					case ackChan <- struct{}{}:
-					default:
-					}
-					return
-				}
-			}
-		}(replica)
-	}
-
-	// Count ACKs until we reach we reach the desired number or timeout
-	ackCount := 0
-	for {
-		select {
-		case <-ackChan:
-			ackCount++
-			fmt.Printf("Processed ACK, total: %d\n", ackCount)
-			if ackCount >= numReplicas {
-				return ackCount
-			}
-		case <-timeout:
-			fmt.Printf("Timeout reached after %dms, received %d ACKs\n", timeoutMs, ackCount)
-			return ackCount
-		}
-	}
+    // Count ACKs until we reach the desired number or timeout
+    ackCount := 0
+    for {
+        select {
+        case <-ackChan:
+            ackCount++
+            fmt.Printf("Processed ACK, total: %d\n", ackCount)
+            if ackCount >= numReplicas {
+                return ackCount
+            }
+        case <-timeout:
+            fmt.Printf("Timeout reached after %dms, received %d ACKs\n", timeoutMs, ackCount)
+            return ackCount
+        }
+    }
 }
 
 func removeReplicaConnection(conn net.Conn) {
