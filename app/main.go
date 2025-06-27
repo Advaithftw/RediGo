@@ -147,7 +147,7 @@ func startReplica(masterAddr string, replicaPort int) {
 				cmd := strings.ToUpper(parts[0])
 				fmt.Printf("Replica received propagated command: %v\n", parts)
 				
-				// Process the command (especially SET commands)
+				// Process the command
 				switch cmd {
 				case "SET":
 					if len(parts) >= 3 {
@@ -164,6 +164,13 @@ func startReplica(masterAddr string, replicaPort int) {
 						store[key] = entry{value: val, expireAt: expireAt}
 						mu.Unlock()
 						fmt.Printf("Replica stored: %s = %s\n", key, val)
+					}
+				case "REPLCONF":
+					if len(parts) >= 3 && strings.ToUpper(parts[1]) == "GETACK" {
+						// Respond with REPLCONF ACK 0 (hardcoded offset for now)
+						response := "*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$1\r\n0\r\n"
+						conn.Write([]byte(response))
+						fmt.Printf("Replica sent ACK response\n")
 					}
 				}
 			}
