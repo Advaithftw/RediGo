@@ -90,37 +90,41 @@ func startReplica(masterAddr string, replicaPort int) {
 	// Don't defer close here - we need to keep the connection open
 	
 	r := bufio.NewReader(conn)
+	w := bufio.NewWriter(conn)
 
 	// Send PING
-	conn.Write([]byte("*1\r\n$4\r\nPING\r\n"))
+	w.WriteString("*1\r\n$4\r\nPING\r\n")
+	w.Flush()
 	r.ReadString('\n')
 
 	// Send REPLCONF listening-port
 	portStr := strconv.Itoa(replicaPort)
 	replconfPort := fmt.Sprintf("*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$%d\r\n%s\r\n", len(portStr), portStr)
-	conn.Write([]byte(replconfPort))
+	w.WriteString(replconfPort)
+	w.Flush()
 	r.ReadString('\n')
 
 	// Send REPLCONF capa psync2
 	replconfCapa := "*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n"
-	conn.Write([]byte(replconfCapa))
+	w.WriteString(replconfCapa)
+	w.Flush()
 	r.ReadString('\n')
 
 	// Send PSYNC
-	conn.Write([]byte("*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n"))
-	
+	w.WriteString("*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n")
+	w.Flush()
+
 	// Read FULLRESYNC response
 	fullresyncResp, _ := r.ReadString('\n')
 	fmt.Printf("Replica received FULLRESYNC: %s", fullresyncResp)
-	
-	// Read RDB file
-	rdbHeader, _ := r.ReadString('\n') // Read $<length>\r\n
+
+	// Read RDB file header
+	rdbHeader, _ := r.ReadString('\n')
 	fmt.Printf("Replica received RDB header: %s", rdbHeader)
-	
-	// Parse RDB length from header like "$88\r\n"
-	rdbLenStr := strings.TrimSpace(rdbHeader[1:]) // Remove $ and \r\n
+
+	rdbLenStr := strings.TrimSpace(rdbHeader[1:])
 	rdbLen, _ := strconv.Atoi(rdbLenStr)
-	
+
 	// Read the RDB content
 	rdbData := make([]byte, rdbLen)
 	_, err = r.Read(rdbData)
@@ -130,7 +134,6 @@ func startReplica(masterAddr string, replicaPort int) {
 	}
 	fmt.Printf("Replica received RDB data of length: %d\n", len(rdbData))
 
-	// Now listen for propagated commands
 	for {
 		line, err := r.ReadString('\n')
 		if err != nil {
@@ -138,13 +141,12 @@ func startReplica(masterAddr string, replicaPort int) {
 			break
 		}
 		line = strings.TrimSpace(line)
-		
+
 		if strings.HasPrefix(line, "*") {
 			numArgs, _ := strconv.Atoi(line[1:])
 			parts := make([]string, 0, numArgs)
-			
-			// Calculate the total bytes for this command for offset tracking
-			commandStart := len(line) + 2 // +2 for \r\n
+
+			commandStart := len(line) + 2
 			totalCommandBytes := commandStart
 
 			for i := 0; i < numArgs; i++ {
@@ -153,7 +155,7 @@ func startReplica(masterAddr string, replicaPort int) {
 					return
 				}
 				totalCommandBytes += len(lengthLine)
-				
+
 				arg, err := r.ReadString('\n')
 				if err != nil {
 					return
@@ -165,26 +167,22 @@ func startReplica(masterAddr string, replicaPort int) {
 			if len(parts) > 0 {
 				cmd := strings.ToUpper(parts[0])
 				fmt.Printf("Replica received propagated command: %v (bytes: %d)\n", parts, totalCommandBytes)
-				
-				// Handle REPLCONF GETACK before updating offset
+
 				if cmd == "REPLCONF" && len(parts) >= 3 && strings.ToUpper(parts[1]) == "GETACK" {
-					// Get current offset BEFORE processing this command
 					replicaOffsetMu.Lock()
 					currentOffset := replicaOffset
 					replicaOffsetMu.Unlock()
-					
-					// Respond with current offset (excluding this GETACK command)
+
 					offsetStr := strconv.Itoa(currentOffset)
 					response := fmt.Sprintf("*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$%d\r\n%s\r\n", len(offsetStr), offsetStr)
-					conn.Write([]byte(response))
+					w.WriteString(response)
+					w.Flush()
 					fmt.Printf("Replica sent ACK response with offset: %d\n", currentOffset)
-					
-					// Update offset after responding
+
 					replicaOffsetMu.Lock()
 					replicaOffset += totalCommandBytes
 					replicaOffsetMu.Unlock()
 				} else {
-					// For all other commands, process them and then update offset
 					switch cmd {
 					case "SET":
 						if len(parts) >= 3 {
@@ -203,11 +201,9 @@ func startReplica(masterAddr string, replicaPort int) {
 							fmt.Printf("Replica stored: %s = %s\n", key, val)
 						}
 					case "PING":
-						// Just process silently, no response needed
 						fmt.Printf("Replica processed PING\n")
 					}
-					
-					// Update offset after processing
+
 					replicaOffsetMu.Lock()
 					replicaOffset += totalCommandBytes
 					replicaOffsetMu.Unlock()
@@ -216,9 +212,10 @@ func startReplica(masterAddr string, replicaPort int) {
 			}
 		}
 	}
-	
+
 	conn.Close()
 }
+
 
 func handleConnection(conn net.Conn) {
 	reader := bufio.NewReader(conn)
