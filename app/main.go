@@ -408,6 +408,15 @@ func handleConnection(conn net.Conn) {
 	}
 }
 
+import (
+    "bufio"
+    "fmt"
+    "io"
+    "strings"
+    "time"
+    "net"
+)
+
 func waitForReplicas(numReplicas int, timeoutMs int) int {
 	replicaMu.Lock()
 	replicas := make([]*replicaConnection, len(replicaConnections))
@@ -444,19 +453,45 @@ func waitForReplicas(numReplicas int, timeoutMs int) int {
 			r.mu.Lock()
 			defer r.mu.Unlock()
 
-			// Set a read deadline
-			err := r.conn.SetReadDeadline(time.Now().Add(time.Duration(timeoutMs) * time.Millisecond))
-			if err != nil {
-				fmt.Printf("Error setting read deadline: %v\n", err)
-				return
+			// Check if connection is already closed
+			if conn, ok := r.conn.(net.Conn); ok {
+				conn.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+				_, err := conn.Read([]byte{})
+				if err != nil && strings.Contains(err.Error(), "use of closed network connection") {
+					fmt.Printf("Connection already closed before reading: %v\n", err)
+					return
+				}
+				// Reset deadline for actual read
+				conn.SetReadDeadline(time.Now().Add(time.Duration(timeoutMs) * time.Millisecond))
 			}
-			defer r.conn.SetReadDeadline(time.Time{})
 
 			// Create a new bufio.Reader
 			reader := bufio.NewReader(r.conn)
 
-			// Read response with a buffer to handle partial data
+			// Try reading immediately to catch data before closure
 			buf := make([]byte, 1024)
+			n, err := reader.Read(buf)
+			if err != nil {
+				if err == io.EOF || strings.Contains(err.Error(), "use of closed network connection") {
+					fmt.Printf("Immediate read failed - connection closed or EOF: %v\n", err)
+				} else {
+					fmt.Printf("Error reading from replica: %v\n", err)
+				}
+				return
+			}
+
+			// Check for ACK in the immediate read
+			data := string(buf[:n])
+			if strings.Contains(data, "ACK") {
+				fmt.Printf("ACK received from replica: %q\n", data)
+				select {
+				case ackChan <- struct{}{}:
+				default:
+				}
+				return
+			}
+
+			// Fallback: keep reading until timeout or ACK
 			for {
 				n, err := reader.Read(buf)
 				if err != nil {
@@ -468,10 +503,9 @@ func waitForReplicas(numReplicas int, timeoutMs int) int {
 					return
 				}
 
-				// Convert buffer to string and check for ACK
-				data := string(buf[:n])
+				data = string(buf[:n])
 				if strings.Contains(data, "ACK") {
-					fmt.Printf("ACK received from replica: %s\n", data)
+					fmt.Printf("ACK received from replica: %q\n", data)
 					select {
 					case ackChan <- struct{}{}:
 					default:
