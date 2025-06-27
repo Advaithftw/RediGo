@@ -219,36 +219,29 @@ func handleConnection(conn net.Conn) {
 				}
 
 			case "SET":
-				key := parts[1]
-				val := parts[2]
-				var expireAt time.Time
-				if len(parts) == 5 && strings.ToUpper(parts[3]) == "PX" {
-					ms, err := strconv.Atoi(parts[4])
-					if err == nil {
-						expireAt = time.Now().Add(time.Duration(ms) * time.Millisecond)
-					}
-				}
-				mu.Lock()
-				store[key] = entry{value: val, expireAt: expireAt}
-				mu.Unlock()
-				conn.Write([]byte("+OK\r\n"))
-				
-				// Only propagate if this is the master
-				if !isReplica {
-					propagateToReplicas(parts)
-				}
-				mu.Lock()
-store[key] = entry{value: val, expireAt: expireAt}
-mu.Unlock()
-conn.Write([]byte("+OK\r\n"))
-
-if !isReplica {
-	masterReplOffset += len(fmt.Sprintf("*%d\r\n", len(parts))) // safe estimate
-	for _, part := range parts {
-		masterReplOffset += len(part) + len(fmt.Sprintf("$%d\r\n", len(part))) + 2 // \r\n
+	key := parts[1]
+	val := parts[2]
+	var expireAt time.Time
+	if len(parts) == 5 && strings.ToUpper(parts[3]) == "PX" {
+		ms, err := strconv.Atoi(parts[4])
+		if err == nil {
+			expireAt = time.Now().Add(time.Duration(ms) * time.Millisecond)
+		}
 	}
-	propagateToReplicas(parts)
-}
+	mu.Lock()
+	store[key] = entry{value: val, expireAt: expireAt}
+	mu.Unlock()
+
+	if !isReplica {
+		conn.Write([]byte("+OK\r\n"))
+
+		masterReplOffset += len(fmt.Sprintf("*%d\r\n", len(parts)))
+		for _, part := range parts {
+			masterReplOffset += len(part) + len(fmt.Sprintf("$%d\r\n", len(part))) + 2
+		}
+		propagateToReplicas(parts)
+	}
+
 
 
 			case "GET":
