@@ -340,8 +340,13 @@ func handleConnection(conn net.Conn) {
 
 			case "WAIT":
 				// WAIT command: WAIT <numreplicas> <timeout>
-				// For now, hardcode response to 0 since no replicas are connected
-				conn.Write([]byte(":0\r\n"))
+				// Return the number of connected replicas
+				replicaMu.Lock()
+				numReplicas := len(replicaConnections)
+				replicaMu.Unlock()
+				
+				resp := fmt.Sprintf(":%d\r\n", numReplicas)
+				conn.Write([]byte(resp))
 
 			case "REPLCONF":
 				conn.Write([]byte("+OK\r\n"))
