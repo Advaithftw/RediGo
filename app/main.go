@@ -159,7 +159,7 @@ func handleConnection(conn net.Conn) {
 					mu.Lock()
 					delete(store, key)
 					mu.Unlock()
-					conn.Write([]byte("\r\n"))
+					conn.Write([]byte("$-1\r\n"))
 				} else {
 					resp := fmt.Sprintf("$%d\r\n%s\r\n", len(e.value), e.value)
 					conn.Write([]byte(resp))
