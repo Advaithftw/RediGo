@@ -187,19 +187,18 @@ func startReplica(masterAddr string, replicaPort int) {
 	} else {
 		fmt.Printf("[REPLICA] ACK successfully flushed for offset %d\n", currentOffset)
 	}
-	
+
 
 
 	replicaOffsetMu.Lock()
 	replicaOffset += totalCommandBytes
 	replicaOffsetMu.Unlock()
-}
- else {
-					switch cmd {
-					case "SET":
-						if len(parts) >= 3 {
-							key := parts[1]
-							val := parts[2]
+} else {
+	switch cmd {
+	case "SET":
+		if len(parts) >= 3 {
+			key := parts[1]
+			val := parts[2]
 							var expireAt time.Time
 							if len(parts) == 5 && strings.ToUpper(parts[3]) == "PX" {
 								ms, err := strconv.Atoi(parts[4])
