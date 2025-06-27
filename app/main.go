@@ -172,7 +172,10 @@ func startReplica(masterAddr string, replicaPort int) {
 					conn.Write([]byte(response))
 					fmt.Printf("Replica sent ACK response with offset: %d\n", currentOffset)
 					
-				
+					// Update offset after responding
+					replicaOffsetMu.Lock()
+					replicaOffset += totalCommandBytes
+					replicaOffsetMu.Unlock()
 				} else {
 					// For all other commands, process them and then update offset
 					switch cmd {
