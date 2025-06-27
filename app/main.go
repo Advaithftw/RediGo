@@ -151,19 +151,20 @@ func handleConnection(conn net.Conn) {
 				conn.Write([]byte("+OK\r\n"))
 
 			case "GET":
-				key := parts[1]
-				mu.RLock()
-				e, exists := store[key]
-				mu.RUnlock()
-				if !exists || (!e.expireAt.IsZero() && time.Now().After(e.expireAt)) {
-					mu.Lock()
-					delete(store, key)
-					mu.Unlock()
-					conn.Write([]byte("$-1\r\n"))
-				} else {
-					resp := fmt.Sprintf("$%d\r\n%s\r\n", len(e.value), e.value)
-					conn.Write([]byte(resp))
-				}
+	key := parts[1]
+	mu.RLock()
+	e, exists := store[key]
+	mu.RUnlock()
+	if !exists || (!e.expireAt.IsZero() && time.Now().After(e.expireAt)) {
+		mu.Lock()
+		delete(store, key)
+		mu.Unlock()
+		conn.Write([]byte("$-1\r\n"))
+	} else {
+		resp := fmt.Sprintf("$%d\r\n%s\r\n", len(e.value), e.value)
+		conn.Write([]byte(resp))
+	}
+
 
 			case "CONFIG":
 				if len(parts) == 3 && strings.ToUpper(parts[1]) == "GET" {
