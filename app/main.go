@@ -153,6 +153,8 @@ func handleConnection(conn net.Conn) {
 				store[key] = entry{value: val, expireAt: expireAt}
 				mu.Unlock()
 				conn.Write([]byte("+OK\r\n"))
+				propagateToReplicas(parts)
+
 
 			case "GET":
 				key := parts[1]
@@ -381,4 +383,20 @@ func readString(r *bufio.Reader) (string, error) {
 	buf := make([]byte, length)
 	_, err = r.Read(buf)
 	return string(buf), err
+}
+
+func propagateToReplicas(parts []string) {
+	replicaMu.Lock()
+	defer replicaMu.Unlock()
+
+	var builder strings.Builder
+	builder.WriteString(fmt.Sprintf("*%d\r\n", len(parts)))
+	for _, part := range parts {
+		builder.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(part), part))
+	}
+	data := []byte(builder.String())
+
+	for _, rconn := range replicaConnections {
+		rconn.Write(data)
+	}
 }
