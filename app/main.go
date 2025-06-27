@@ -169,20 +169,30 @@ func startReplica(masterAddr string, replicaPort int) {
 				fmt.Printf("Replica received propagated command: %v (bytes: %d)\n", parts, totalCommandBytes)
 
 				if cmd == "REPLCONF" && len(parts) >= 3 && strings.ToUpper(parts[1]) == "GETACK" {
-					replicaOffsetMu.Lock()
-					currentOffset := replicaOffset
-					replicaOffsetMu.Unlock()
+	replicaOffsetMu.Lock()
+	currentOffset := replicaOffset
+	replicaOffsetMu.Unlock()
 
-					offsetStr := strconv.Itoa(currentOffset)
-					response := fmt.Sprintf("*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$%d\r\n%s\r\n", len(offsetStr), offsetStr)
-					w.WriteString(response)
-					w.Flush()
-					fmt.Printf("Replica sent ACK response with offset: %d\n", currentOffset)
+	offsetStr := strconv.Itoa(currentOffset)
+	response := fmt.Sprintf("*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$%d\r\n%s\r\n", len(offsetStr), offsetStr)
 
-					replicaOffsetMu.Lock()
-					replicaOffset += totalCommandBytes
-					replicaOffsetMu.Unlock()
-				} else {
+	fmt.Printf("[REPLICA] Preparing ACK for offset %d: %q\n", currentOffset, response)
+	_, err := w.WriteString(response)
+	if err != nil {
+		fmt.Printf("[REPLICA] ERROR writing ACK: %v\n", err)
+	}
+	err = w.Flush()
+	if err != nil {
+		fmt.Printf("[REPLICA] ERROR flushing ACK: %v\n", err)
+	} else {
+		fmt.Printf("[REPLICA] ACK successfully flushed for offset %d\n", currentOffset)
+	}
+
+	replicaOffsetMu.Lock()
+	replicaOffset += totalCommandBytes
+	replicaOffsetMu.Unlock()
+}
+ else {
 					switch cmd {
 					case "SET":
 						if len(parts) >= 3 {
