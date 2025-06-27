@@ -98,6 +98,8 @@ func handleConnection(conn net.Conn) {
 	defer conn.Close()
 	reader := bufio.NewReader(conn)
 
+
+	
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
