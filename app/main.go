@@ -219,11 +219,28 @@ func handleConnection(conn net.Conn) {
 				conn.Write([]byte("+OK\r\n"))
 			case "PSYNC":
 	if len(parts) == 3 && parts[1] == "?" && parts[2] == "-1" {
-		reply := fmt.Sprintf("+FULLRESYNC %s %d\r\n", masterReplId, masterReplOffset)
-		conn.Write([]byte(reply))
+		// 1. Send FULLRESYNC line
+		fullResync := fmt.Sprintf("+FULLRESYNC %s %d\r\n", masterReplId, masterReplOffset)
+		conn.Write([]byte(fullResync))
+
+		// 2. Prepare empty RDB file bytes
+		emptyRDB := []byte{
+			0x52, 0x45, 0x44, 0x49, 0x53, 0x30, 0x30, 0x30, 0x37, // "REDIS0007"
+			0xFF, // End of file opcode
+			0x00, 0x00, // Checksum (placeholder, still accepted)
+			0x00, 0x00,
+			0x00, 0x00,
+			0x00, 0x00,
+		}
+
+		// 3. Send RESP-like bulk string header (without trailing \r\n in content)
+		rdbLen := len(emptyRDB)
+		conn.Write([]byte(fmt.Sprintf("$%d\r\n", rdbLen)))
+		conn.Write(emptyRDB) // no trailing \r\n after content
 	} else {
 		conn.Write([]byte("-ERR unsupported PSYNC format\r\n"))
 	}
+
 
 
 			default:
