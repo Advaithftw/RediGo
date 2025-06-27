@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"net"
@@ -224,7 +225,7 @@ func handleConnection(conn net.Conn) {
 	}
 }
 
-// Load a single key-value from an RDB file
+// Load RDB file with proper expiry handling
 func loadRDB(path string) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -234,6 +235,7 @@ func loadRDB(path string) {
 
 	reader := bufio.NewReader(file)
 
+	// Read and verify header
 	header := make([]byte, 9)
 	_, err = reader.Read(header)
 	if err != nil || string(header[:5]) != "REDIS" {
@@ -241,24 +243,77 @@ func loadRDB(path string) {
 	}
 
 	for {
-		prefix, err := reader.ReadByte()
+		opcode, err := reader.ReadByte()
 		if err != nil {
 			break
 		}
 
-		if prefix == 0x00 { // string type
+		switch opcode {
+		case 0xFF: // EOF
+			return
+		case 0xFE: // Database selector
+			_, _ = readLength(reader) // Skip database number
+		case 0xFB: // Resizedb
+			_, _ = readLength(reader) // Skip hash table size
+			_, _ = readLength(reader) // Skip expire hash table size
+		case 0xFA: // Auxiliary field
+			_, _ = readString(reader) // Skip key
+			_, _ = readString(reader) // Skip value
+		case 0xFD: // Expiry in seconds
+			expiry := make([]byte, 4)
+			_, err = reader.Read(expiry)
+			if err != nil {
+				return
+			}
+			expiryTime := time.Unix(int64(binary.LittleEndian.Uint32(expiry)), 0)
+			
+			valueType, err := reader.ReadByte()
+			if err != nil {
+				return
+			}
+			
+			if valueType == 0x00 { // String type
+				key, _ := readString(reader)
+				val, _ := readString(reader)
+				mu.Lock()
+				store[key] = entry{value: val, expireAt: expiryTime}
+				mu.Unlock()
+			}
+		case 0xFC: // Expiry in milliseconds
+			expiry := make([]byte, 8)
+			_, err = reader.Read(expiry)
+			if err != nil {
+				return
+			}
+			expiryMs := int64(binary.LittleEndian.Uint64(expiry))
+			expiryTime := time.Unix(expiryMs/1000, (expiryMs%1000)*1000000)
+			
+			valueType, err := reader.ReadByte()
+			if err != nil {
+				return
+			}
+			
+			if valueType == 0x00 { // String type
+				key, _ := readString(reader)
+				val, _ := readString(reader)
+				mu.Lock()
+				store[key] = entry{value: val, expireAt: expiryTime}
+				mu.Unlock()
+			}
+		case 0x00: // String type without expiry
 			key, _ := readString(reader)
 			val, _ := readString(reader)
 			mu.Lock()
 			store[key] = entry{value: val}
 			mu.Unlock()
-		} else if prefix == 0xFF {
-			break
+		default:
+			// Skip unknown opcodes or other value types
+			continue
 		}
 	}
 }
 
-// RESP RDB helpers
+// Read length-encoded integer
 func readLength(r *bufio.Reader) (int, error) {
 	b, err := r.ReadByte()
 	if err != nil {
@@ -279,12 +334,13 @@ func readLength(r *bufio.Reader) (int, error) {
 		if err != nil {
 			return 0, err
 		}
-		return int(bytes[0])<<24 | int(bytes[1])<<16 | int(bytes[2])<<8 | int(bytes[3]), nil
+		return int(binary.BigEndian.Uint32(bytes)), nil
 	default:
 		return 0, fmt.Errorf("unsupported length encoding")
 	}
 }
 
+// Read string from RDB
 func readString(r *bufio.Reader) (string, error) {
 	length, err := readLength(r)
 	if err != nil {
