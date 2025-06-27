@@ -78,27 +78,21 @@ func startReplica(masterAddr string, replicaPort int) {
 	defer conn.Close()
 	r := bufio.NewReader(conn)
 
-	// 1. PING
 	conn.Write([]byte("*1\r\n$4\r\nPING\r\n"))
-	r.ReadString('\n') // +PONG
+	r.ReadString('\n')
 
-	// 2. REPLCONF listening-port <PORT>
 	portStr := strconv.Itoa(replicaPort)
 	replconfPort := fmt.Sprintf("*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$%d\r\n%s\r\n", len(portStr), portStr)
 	conn.Write([]byte(replconfPort))
-	r.ReadString('\n') // +OK
+	r.ReadString('\n')
 
-	// 3. REPLCONF capa psync2
 	replconfCapa := "*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n"
 	conn.Write([]byte(replconfCapa))
-	r.ReadString('\n') // +OK
+	r.ReadString('\n')
 
-	// 4. PSYNC ? -1
 	conn.Write([]byte("*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n"))
-	r.ReadString('\n') // +FULLRESYNC <replid> 0
+	r.ReadString('\n')
 }
-
-
 
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
@@ -116,10 +110,7 @@ func handleConnection(conn net.Conn) {
 			parts := make([]string, 0, numArgs)
 
 			for i := 0; i < numArgs; i++ {
-				_, err := reader.ReadString('\n') // skip $<len>
-				if err != nil {
-					return
-				}
+				reader.ReadString('\n') // skip $<len>
 				arg, err := reader.ReadString('\n')
 				if err != nil {
 					return
@@ -208,20 +199,23 @@ func handleConnection(conn net.Conn) {
 				}
 
 			case "INFO":
-	if len(parts) == 2 && strings.ToLower(parts[1]) == "replication" {
-		var info strings.Builder
-		role := "master"
-		if isReplica {
-			role = "slave"
-		}
-		info.WriteString(fmt.Sprintf("role:%s\r\n", role))
-		if !isReplica {
-			info.WriteString(fmt.Sprintf("master_replid:%s\r\n", masterReplId))
-			info.WriteString(fmt.Sprintf("master_repl_offset:%d\r\n", masterReplOffset))
-		}
-		resp := fmt.Sprintf("$%d\r\n%s\r\n", info.Len(), info.String())
-		conn.Write([]byte(resp))
-	}
+				if len(parts) == 2 && strings.ToLower(parts[1]) == "replication" {
+					var info strings.Builder
+					role := "master"
+					if isReplica {
+						role = "slave"
+					}
+					info.WriteString(fmt.Sprintf("role:%s\r\n", role))
+					if !isReplica {
+						info.WriteString(fmt.Sprintf("master_replid:%s\r\n", masterReplId))
+						info.WriteString(fmt.Sprintf("master_repl_offset:%d\r\n", masterReplOffset))
+					}
+					resp := fmt.Sprintf("$%d\r\n%s\r\n", info.Len(), info.String())
+					conn.Write([]byte(resp))
+				}
+
+			case "REPLCONF":
+				conn.Write([]byte("+OK\r\n"))
 
 			default:
 				conn.Write([]byte("-ERR unknown command\r\n"))
@@ -230,14 +224,14 @@ func handleConnection(conn net.Conn) {
 	}
 }
 
-// Read RDB file and populate store
+// Load a single key-value from an RDB file
 func loadRDB(path string) {
 	file, err := os.Open(path)
 	if err != nil {
-		// File doesn't exist
 		return
 	}
 	defer file.Close()
+
 	reader := bufio.NewReader(file)
 
 	header := make([]byte, 9)
@@ -252,55 +246,19 @@ func loadRDB(path string) {
 			break
 		}
 
-		if prefix == 0xFA {
-			_, _ = readString(reader)
-			_, _ = readString(reader)
-
-		} else if prefix == 0xFE {
-			_, _ = readLength(reader)
-
-		} else if prefix == 0xFB {
-			_, _ = readLength(reader)
-			_, _ = readLength(reader)
-
-		} else if prefix == 0xFC || prefix == 0xFD {
-			var expireAt time.Time
-			if prefix == 0xFD {
-				t := make([]byte, 4)
-				reader.Read(t)
-				sec := int64(t[0]) | int64(t[1])<<8 | int64(t[2])<<16 | int64(t[3])<<24
-				expireAt = time.Unix(sec, 0)
-			} else {
-				t := make([]byte, 8)
-				reader.Read(t)
-				ms := int64(t[0]) | int64(t[1])<<8 | int64(t[2])<<16 | int64(t[3])<<24 |
-					int64(t[4])<<32 | int64(t[5])<<40 | int64(t[6])<<48 | int64(t[7])<<56
-				expireAt = time.UnixMilli(ms)
-			}
-			typ, _ := reader.ReadByte()
-			if typ != 0x00 {
-				continue
-			}
-			key, _ := readString(reader)
-			val, _ := readString(reader)
-			mu.Lock()
-			store[key] = entry{value: val, expireAt: expireAt}
-			mu.Unlock()
-
-		} else if prefix == 0x00 {
+		if prefix == 0x00 { // string type
 			key, _ := readString(reader)
 			val, _ := readString(reader)
 			mu.Lock()
 			store[key] = entry{value: val}
 			mu.Unlock()
-
 		} else if prefix == 0xFF {
 			break
 		}
 	}
 }
 
-// Helpers
+// RESP RDB helpers
 func readLength(r *bufio.Reader) (int, error) {
 	b, err := r.ReadByte()
 	if err != nil {
