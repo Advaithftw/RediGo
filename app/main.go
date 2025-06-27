@@ -28,6 +28,8 @@ var masterReplId = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb"
 var masterReplOffset = 0
 var replicaConnections []net.Conn
 var replicaMu sync.Mutex
+var replicaOffset = 0
+var replicaOffsetMu sync.Mutex
 
 func main() {
 	dirFlag := flag.String("dir", ".", "Directory for RDB file")
@@ -133,45 +135,76 @@ func startReplica(masterAddr string, replicaPort int) {
 		if strings.HasPrefix(line, "*") {
 			numArgs, _ := strconv.Atoi(line[1:])
 			parts := make([]string, 0, numArgs)
+			
+			// Calculate the total bytes for this command for offset tracking
+			commandStart := len(line) + 2 // +2 for \r\n
+			totalCommandBytes := commandStart
 
 			for i := 0; i < numArgs; i++ {
-				r.ReadString('\n') // skip $<len>
+				lengthLine, err := r.ReadString('\n')
+				if err != nil {
+					return
+				}
+				totalCommandBytes += len(lengthLine)
+				
 				arg, err := r.ReadString('\n')
 				if err != nil {
 					return
 				}
+				totalCommandBytes += len(arg)
 				parts = append(parts, strings.TrimSpace(arg))
 			}
 
 			if len(parts) > 0 {
 				cmd := strings.ToUpper(parts[0])
-				fmt.Printf("Replica received propagated command: %v\n", parts)
+				fmt.Printf("Replica received propagated command: %v (bytes: %d)\n", parts, totalCommandBytes)
 				
-				// Process the command
-				switch cmd {
-				case "SET":
-					if len(parts) >= 3 {
-						key := parts[1]
-						val := parts[2]
-						var expireAt time.Time
-						if len(parts) == 5 && strings.ToUpper(parts[3]) == "PX" {
-							ms, err := strconv.Atoi(parts[4])
-							if err == nil {
-								expireAt = time.Now().Add(time.Duration(ms) * time.Millisecond)
+				// Handle REPLCONF GETACK before updating offset
+				if cmd == "REPLCONF" && len(parts) >= 3 && strings.ToUpper(parts[1]) == "GETACK" {
+					// Get current offset BEFORE processing this command
+					replicaOffsetMu.Lock()
+					currentOffset := replicaOffset
+					replicaOffsetMu.Unlock()
+					
+					// Respond with current offset (excluding this GETACK command)
+					offsetStr := strconv.Itoa(currentOffset)
+					response := fmt.Sprintf("*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$%d\r\n%s\r\n", len(offsetStr), offsetStr)
+					conn.Write([]byte(response))
+					fmt.Printf("Replica sent ACK response with offset: %d\n", currentOffset)
+					
+					// Update offset after responding
+					replicaOffsetMu.Lock()
+					replicaOffset += totalCommandBytes
+					replicaOffsetMu.Unlock()
+				} else {
+					// For all other commands, process them and then update offset
+					switch cmd {
+					case "SET":
+						if len(parts) >= 3 {
+							key := parts[1]
+							val := parts[2]
+							var expireAt time.Time
+							if len(parts) == 5 && strings.ToUpper(parts[3]) == "PX" {
+								ms, err := strconv.Atoi(parts[4])
+								if err == nil {
+									expireAt = time.Now().Add(time.Duration(ms) * time.Millisecond)
+								}
 							}
+							mu.Lock()
+							store[key] = entry{value: val, expireAt: expireAt}
+							mu.Unlock()
+							fmt.Printf("Replica stored: %s = %s\n", key, val)
 						}
-						mu.Lock()
-						store[key] = entry{value: val, expireAt: expireAt}
-						mu.Unlock()
-						fmt.Printf("Replica stored: %s = %s\n", key, val)
+					case "PING":
+						// Just process silently, no response needed
+						fmt.Printf("Replica processed PING\n")
 					}
-				case "REPLCONF":
-					if len(parts) >= 3 && strings.ToUpper(parts[1]) == "GETACK" {
-						// Respond with REPLCONF ACK 0 (hardcoded offset for now)
-						response := "*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$1\r\n0\r\n"
-						conn.Write([]byte(response))
-						fmt.Printf("Replica sent ACK response\n")
-					}
+					
+					// Update offset after processing
+					replicaOffsetMu.Lock()
+					replicaOffset += totalCommandBytes
+					replicaOffsetMu.Unlock()
+					fmt.Printf("Replica offset updated to: %d\n", replicaOffset)
 				}
 			}
 		}
