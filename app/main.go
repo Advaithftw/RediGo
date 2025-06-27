@@ -96,6 +96,55 @@ func startReplica(masterAddr string, replicaPort int) {
 
 	conn.Write([]byte("*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n"))
 	r.ReadString('\n')
+		go func() {
+		for {
+			line, err := r.ReadString('\n')
+			if err != nil {
+				return // connection closed or error
+			}
+			line = strings.TrimSpace(line)
+
+			if strings.HasPrefix(line, "*") {
+				numArgs, _ := strconv.Atoi(line[1:])
+				args := make([]string, 0, numArgs)
+
+				for i := 0; i < numArgs; i++ {
+					r.ReadString('\n') // skip $<len>
+					arg, err := r.ReadString('\n')
+					if err != nil {
+						return
+					}
+					args = append(args, strings.TrimSpace(arg))
+				}
+
+				if len(args) == 0 {
+					continue
+				}
+
+				cmd := strings.ToUpper(args[0])
+				switch cmd {
+				case "SET":
+					if len(args) >= 3 {
+						key := args[1]
+						val := args[2]
+						var expireAt time.Time
+						if len(args) == 5 && strings.ToUpper(args[3]) == "PX" {
+							ms, err := strconv.Atoi(args[4])
+							if err == nil {
+								expireAt = time.Now().Add(time.Duration(ms) * time.Millisecond)
+							}
+						}
+						mu.Lock()
+						store[key] = entry{value: val, expireAt: expireAt}
+						mu.Unlock()
+						// ⚠️ No response to master!
+					}
+				// You can add support for DEL, EXPIRE, etc., here
+				}
+			}
+		}
+	}()
+
 }
 
 func handleConnection(conn net.Conn) {
