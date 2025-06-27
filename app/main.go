@@ -217,6 +217,14 @@ func handleConnection(conn net.Conn) {
 
 			case "REPLCONF":
 				conn.Write([]byte("+OK\r\n"))
+			case "PSYNC":
+	if len(parts) == 3 && parts[1] == "?" && parts[2] == "-1" {
+		reply := fmt.Sprintf("+FULLRESYNC %s %d\r\n", masterReplId, masterReplOffset)
+		conn.Write([]byte(reply))
+	} else {
+		conn.Write([]byte("-ERR unsupported PSYNC format\r\n"))
+	}
+
 
 			default:
 				conn.Write([]byte("-ERR unknown command\r\n"))
