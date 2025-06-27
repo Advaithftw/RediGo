@@ -4,15 +4,12 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
-	"io"
 	"net"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-	"encoding/binary" // Added import for binary
 )
 
 type entry struct {
@@ -41,7 +38,7 @@ func main() {
 	configFilename = *fileFlag
 	isReplica = *replicaFlag != ""
 
-	rdbPath := filepath.Join(configDir, configFilename)
+	rdbPath := configDir + "/" + configFilename
 	loadRDB(rdbPath)
 
 	if isReplica {
@@ -158,7 +155,6 @@ func handleConnection(conn net.Conn) {
 				mu.RLock()
 				e, exists := store[key]
 				mu.RUnlock()
-				fmt.Printf("GET key: %s, exists: %v, expireAt: %v\n", key, exists, e.expireAt) // Debug log
 				if !exists || (!e.expireAt.IsZero() && time.Now().After(e.expireAt)) {
 					mu.Lock()
 					delete(store, key)
@@ -221,33 +217,6 @@ func handleConnection(conn net.Conn) {
 			case "REPLCONF":
 				conn.Write([]byte("+OK\r\n"))
 
-			case "PSYNC":
-				// 1) Acknowledge full resync
-				conn.Write([]byte("+FULLRESYNC " + masterReplId + " 0\r\n"))
-
-				// 2) Open your RDB file and stream it raw
-				f, err := os.Open(filepath.Join(configDir, configFilename))
-				if err != nil {
-					// If no RDB, just end the sync
-					break
-				}
-				defer f.Close()
-
-				// Get file size for RDB prefix
-				fileInfo, err := f.Stat()
-				if err != nil {
-					break
-				}
-				fileSize := fileInfo.Size()
-
-				// Send RDB file prefixed with $<length>\r\n
-				conn.Write([]byte(fmt.Sprintf("$%d\r\n", fileSize)))
-				_, err = io.Copy(conn, f)
-				if err != nil {
-					fmt.Println("Error sending RDB file:", err)
-					break
-				}
-
 			default:
 				conn.Write([]byte("-ERR unknown command\r\n"))
 			}
@@ -255,80 +224,36 @@ func handleConnection(conn net.Conn) {
 	}
 }
 
+// Load a single key-value from an RDB file
 func loadRDB(path string) {
 	file, err := os.Open(path)
 	if err != nil {
-		fmt.Printf("Failed to open RDB file %s: %v\n", path, err)
 		return
 	}
 	defer file.Close()
 
 	reader := bufio.NewReader(file)
 
-	// Read RDB header (REDISxxxxx)
 	header := make([]byte, 9)
 	_, err = reader.Read(header)
 	if err != nil || string(header[:5]) != "REDIS" {
-		fmt.Printf("Invalid RDB header or read error: %v\n", err)
 		return
 	}
 
 	for {
 		prefix, err := reader.ReadByte()
 		if err != nil {
-			if err != io.EOF {
-				fmt.Printf("Error reading prefix: %v\n", err)
-			}
 			break
 		}
 
-		var expireAt time.Time
-		if prefix == 0xFC { // Expiry in milliseconds
-			var expireMs uint64
-			if err := binary.Read(reader, binary.LittleEndian, &expireMs); err != nil {
-				fmt.Printf("Error reading expiry (ms): %v\n", err)
-				break
-			}
-			expireAt = time.Unix(0, int64(expireMs)*int64(time.Millisecond))
-			prefix, err = reader.ReadByte() // Read next opcode (should be value-е value type)
-			if err != nil {
-				fmt.Printf("Error reading value type after expiry: %v\n", err)
-				break
-			}
-		} else if prefix == 0xFD { // Expiry in seconds
-			var expireSec uint32
-			if err := binary.Read(reader, binary.LittleEndian, &expireSec); err != nil {
-				fmt.Printf("Error reading expiry (sec): %v\n", err)
-				break
-			}
-			expireAt = time.Unix(int64(expireSec), 0)
-			prefix, err = reader.ReadByte() // Read next opcode (should be value type)
-			if err != nil {
-				fmt.Printf("Error reading value type after expiry: %v\n", err)
-				break
-			}
-		}
-
-		if prefix == 0x00 { // String type
-			key, err := readString(reader)
-			if err != nil {
-				fmt.Printf("Error reading key: %v\n", err)
-				break
-			}
-			val, err := readString(reader)
-			if err != nil {
-				fmt.Printf("Error reading value: %v\n", err)
-				break
-			}
-			fmt.Printf("Loaded key: %s, value: %s, expireAt: %v\n", key, val, expireAt) // Debug log
+		if prefix == 0x00 { // string type
+			key, _ := readString(reader)
+			val, _ := readString(reader)
 			mu.Lock()
-			store[key] = entry{value: val, expireAt: expireAt}
+			store[key] = entry{value: val}
 			mu.Unlock()
-		} else if prefix == 0xFF { // End of file
+		} else if prefix == 0xFF {
 			break
-		} else {
-			fmt.Printf("Skipping unsupported opcode: 0x%X\n", prefix)
-			// Skip to next opcode or handle other types if needed
 		}
 	}
 }
