@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"io"
 )
 
 type entry struct {
