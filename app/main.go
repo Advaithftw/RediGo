@@ -187,7 +187,8 @@ func startReplica(masterAddr string, replicaPort int) {
 	} else {
 		fmt.Printf("[REPLICA] ACK successfully flushed for offset %d\n", currentOffset)
 	}
-}
+	
+
 
 	replicaOffsetMu.Lock()
 	replicaOffset += totalCommandBytes
