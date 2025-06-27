@@ -18,6 +18,12 @@ type entry struct {
 	expireAt time.Time
 }
 
+type replica struct {
+	conn   net.Conn
+	ack    int
+}
+
+
 var store = make(map[string]entry)
 var mu sync.RWMutex
 
@@ -30,6 +36,8 @@ var replicaConnections []net.Conn
 var replicaMu sync.Mutex
 var replicaOffset = 0
 var replicaOffsetMu sync.Mutex
+var replicaConnections []replica
+
 
 func main() {
 	dirFlag := flag.String("dir", ".", "Directory for RDB file")
@@ -273,6 +281,19 @@ func handleConnection(conn net.Conn) {
 				if !isReplica {
 					propagateToReplicas(parts)
 				}
+				mu.Lock()
+store[key] = entry{value: val, expireAt: expireAt}
+mu.Unlock()
+conn.Write([]byte("+OK\r\n"))
+
+if !isReplica {
+	masterReplOffset += len(fmt.Sprintf("*%d\r\n", len(parts))) // safe estimate
+	for _, part := range parts {
+		masterReplOffset += len(part) + len(fmt.Sprintf("$%d\r\n", len(part))) + 2 // \r\n
+	}
+	propagateToReplicas(parts)
+}
+
 
 			case "GET":
 				key := parts[1]
@@ -339,17 +360,50 @@ func handleConnection(conn net.Conn) {
 				}
 
 			case "WAIT":
-				// WAIT command: WAIT <numreplicas> <timeout>
-				// Return the number of connected replicas
-				replicaMu.Lock()
-				numReplicas := len(replicaConnections)
-				replicaMu.Unlock()
-				
-				resp := fmt.Sprintf(":%d\r\n", numReplicas)
-				conn.Write([]byte(resp))
+	if len(parts) != 3 {
+		conn.Write([]byte("-ERR wrong number of arguments for 'WAIT'\r\n"))
+		return
+	}
+	required, _ := strconv.Atoi(parts[1])
+	timeoutMs, _ := strconv.Atoi(parts[2])
+
+	start := time.Now()
+	var acked int
+
+	for {
+		replicaMu.Lock()
+		acked = 0
+		for _, rep := range replicaConnections {
+			if rep.ack >= masterReplOffset {
+				acked++
+			}
+		}
+		replicaMu.Unlock()
+
+		if acked >= required || time.Since(start) >= time.Duration(timeoutMs)*time.Millisecond {
+			break
+		}
+		time.Sleep(10 * time.Millisecond) // small sleep to avoid busy waiting
+	}
+
+	resp := fmt.Sprintf(":%d\r\n", acked)
+	conn.Write([]byte(resp))
+
 
 			case "REPLCONF":
-				conn.Write([]byte("+OK\r\n"))
+	if len(parts) >= 3 && strings.ToUpper(parts[1]) == "ACK" {
+		ackOffset, _ := strconv.Atoi(parts[2])
+		replicaMu.Lock()
+		for i := range replicaConnections {
+			if replicaConnections[i].conn == conn {
+				replicaConnections[i].ack = ackOffset
+				break
+			}
+		}
+		replicaMu.Unlock()
+	}
+	conn.Write([]byte("+OK\r\n"))
+
 				
 			case "PSYNC":
 				if len(parts) == 3 && parts[1] == "?" && parts[2] == "-1" {
