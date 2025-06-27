@@ -409,6 +409,7 @@ func handleConnection(conn net.Conn) {
 }
 
 
+
 func waitForReplicas(numReplicas int, timeoutMs int) int {
 	replicaMu.Lock()
 	replicas := make([]*replicaConnection, len(replicaConnections))
@@ -423,79 +424,54 @@ func waitForReplicas(numReplicas int, timeoutMs int) int {
 		return len(replicas)
 	}
 
+	// Log timeout for debugging
+	fmt.Printf("waitForReplicas called with timeoutMs: %d, numReplicas: %d\n", timeoutMs, numReplicas)
+
 	// Send REPLCONF GETACK * to all replicas
 	getackCmd := "*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n"
-	for _, replica := range replicas {
-		replica.mu.Lock()
-		_, err := replica.conn.Write([]byte(getackCmd))
-		replica.mu.Unlock()
-		if err != nil {
-			fmt.Printf("Error sending GETACK to replica: %v\n", err)
-			continue
-		}
-	}
-
-	// Wait for ACK responses with timeout
 	ackChan := make(chan struct{}, len(replicas))
 	timeout := time.After(time.Duration(timeoutMs) * time.Millisecond)
 
-	// Start goroutines to read ACK responses
 	for _, replica := range replicas {
 		go func(r *replicaConnection) {
 			r.mu.Lock()
 			defer r.mu.Unlock()
 
-			// Check if connection is already closed
-			if conn, ok := r.conn.(net.Conn); ok {
-				conn.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
-				_, err := conn.Read([]byte{})
-				if err != nil && strings.Contains(err.Error(), "use of closed network connection") {
-					fmt.Printf("Connection already closed before reading: %v\n", err)
-					return
-				}
-				// Reset deadline for actual read
-				conn.SetReadDeadline(time.Now().Add(time.Duration(timeoutMs) * time.Millisecond))
+			// Write GETACK command
+			_, err := r.conn.Write([]byte(getackCmd))
+			if err != nil {
+				fmt.Printf("Error sending GETACK to replica: %v\n", err)
+				return
 			}
+
+			// Set read deadline
+			if err := r.conn.SetReadDeadline(time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)); err != nil {
+				fmt.Printf("Error setting read deadline: %v\n", err)
+				return
+			}
+			defer r.conn.SetReadDeadline(time.Time{})
 
 			// Create a new bufio.Reader
 			reader := bufio.NewReader(r.conn)
+			data := ""
 
-			// Try reading immediately to catch data before closure
+			// Read until ACK or error
 			buf := make([]byte, 1024)
-			n, err := reader.Read(buf)
-			if err != nil {
-				if err == io.EOF || strings.Contains(err.Error(), "use of closed network connection") {
-					fmt.Printf("Immediate read failed - connection closed or EOF: %v\n", err)
-				} else {
-					fmt.Printf("Error reading from replica: %v\n", err)
-				}
-				return
-			}
-
-			// Check for ACK in the immediate read
-			data := string(buf[:n])
-			if strings.Contains(data, "ACK") {
-				fmt.Printf("ACK received from replica: %q\n", data)
-				select {
-				case ackChan <- struct{}{}:
-				default:
-				}
-				return
-			}
-
-			// Fallback: keep reading until timeout or ACK
 			for {
 				n, err := reader.Read(buf)
 				if err != nil {
 					if err == io.EOF || strings.Contains(err.Error(), "use of closed network connection") {
-						fmt.Printf("Connection closed or EOF while reading from replica: %v\n", err)
+						fmt.Printf("Connection closed or EOF while reading from replica: %v, data so far: %q\n", err, data)
+					} else if strings.Contains(err.Error(), "i/o timeout") {
+						fmt.Printf("Read timeout from replica: %v, data so far: %q\n", err, data)
 					} else {
-						fmt.Printf("Error reading from replica: %v\n", err)
+						fmt.Printf("Error reading from replica: %v, data so far: %q\n", err, data)
 					}
 					return
 				}
 
-				data = string(buf[:n])
+				data += string(buf[:n])
+				fmt.Printf("Data received from replica: %q\n", string(buf[:n]))
 				if strings.Contains(data, "ACK") {
 					fmt.Printf("ACK received from replica: %q\n", data)
 					select {
@@ -508,7 +484,7 @@ func waitForReplicas(numReplicas int, timeoutMs int) int {
 		}(replica)
 	}
 
-	// Count ACKs until we reach the desired number or timeout
+	// Count ACKs until we reach we reach the desired number or timeout
 	ackCount := 0
 	for {
 		select {
