@@ -226,37 +226,60 @@ func handleConnection(conn net.Conn) {
 
 // Load a single key-value from an RDB file
 func loadRDB(path string) {
-	file, err := os.Open(path)
-	if err != nil {
-		return
-	}
-	defer file.Close()
+    file, err := os.Open(path)
+    if err != nil {
+        return
+    }
+    defer file.Close()
 
-	reader := bufio.NewReader(file)
+    reader := bufio.NewReader(file)
+    // Skip header line (e.g. "REDIS0008\n")
+    if _, err := reader.ReadString('\n'); err != nil {
+        return
+    }
 
-	header := make([]byte, 9)
-	_, err = reader.Read(header)
-	if err != nil || string(header[:5]) != "REDIS" {
-		return
-	}
+    for {
+        prefix, err := reader.ReadByte()
+        if err != nil {
+            break
+        }
+        // 0xFF = EOF
+        if prefix == 0xFF {
+            break
+        }
 
-	for {
-		prefix, err := reader.ReadByte()
-		if err != nil {
-			break
-		}
+        var expireAt time.Time
+        // 0xFD = EXPIRETIME_MS
+        if prefix == 0xFD {
+            var buf [8]byte
+            if _, err := reader.Read(buf[:]); err != nil {
+                break
+            }
+            ms := int64(binary.BigEndian.Uint64(buf[:]))
+            expireAt = time.Unix(0, ms*int64(time.Millisecond))
+            // next byte is the real type
+            prefix, err = reader.ReadByte()
+            if err != nil {
+                break
+            }
+        }
 
-		if prefix == 0x00 { // string type
-			key, _ := readString(reader)
-			val, _ := readString(reader)
-			mu.Lock()
-			store[key] = entry{value: val}
-			mu.Unlock()
-		} else if prefix == 0xFF {
-			break
-		}
-	}
+        if prefix == 0x00 {
+            key, err1 := readString(reader)
+            val, err2 := readString(reader)
+            if err1 != nil || err2 != nil {
+                continue
+            }
+            mu.Lock()
+            store[key] = entry{value: val, expireAt: expireAt}
+            mu.Unlock()
+        } else {
+            // unsupported type: bail out or skip
+            break
+        }
+    }
 }
+
 
 // RESP RDB helpers
 func readLength(r *bufio.Reader) (int, error) {
