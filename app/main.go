@@ -26,6 +26,9 @@ var configFilename string
 var isReplica bool
 var masterReplId = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb"
 var masterReplOffset = 0
+var replicaConnections []net.Conn
+var replicaMu sync.Mutex
+
 
 func main() {
 	dirFlag := flag.String("dir", ".", "Directory for RDB file")
@@ -150,6 +153,8 @@ func handleConnection(conn net.Conn) {
 				store[key] = entry{value: val, expireAt: expireAt}
 				mu.Unlock()
 				conn.Write([]byte("+OK\r\n"))
+				propagateToReplicas(parts)
+
 
 			case "GET":
 				key := parts[1]
@@ -237,6 +242,10 @@ func handleConnection(conn net.Conn) {
 		rdbLen := len(emptyRDB)
 		conn.Write([]byte(fmt.Sprintf("$%d\r\n", rdbLen)))
 		conn.Write(emptyRDB) // no trailing \r\n after content
+		replicaMu.Lock()
+replicaConnections = append(replicaConnections, conn)
+replicaMu.Unlock()
+
 	} else {
 		conn.Write([]byte("-ERR unsupported PSYNC format\r\n"))
 	}
@@ -374,4 +383,20 @@ func readString(r *bufio.Reader) (string, error) {
 	buf := make([]byte, length)
 	_, err = r.Read(buf)
 	return string(buf), err
+}
+
+func propagateToReplicas(parts []string) {
+	replicaMu.Lock()
+	defer replicaMu.Unlock()
+
+	var builder strings.Builder
+	builder.WriteString(fmt.Sprintf("*%d\r\n", len(parts)))
+	for _, part := range parts {
+		builder.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(part), part))
+	}
+	data := []byte(builder.String())
+
+	for _, rconn := range replicaConnections {
+		rconn.Write(data)
+	}
 }
