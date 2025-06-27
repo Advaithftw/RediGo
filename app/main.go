@@ -11,18 +11,11 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"io"
 )
 
 type entry struct {
 	value    string
 	expireAt time.Time
-}
-
-type replicaConnection struct {
-	conn   net.Conn
-	reader *bufio.Reader
-	mu     sync.Mutex
 }
 
 var store = make(map[string]entry)
@@ -33,7 +26,7 @@ var configFilename string
 var isReplica bool
 var masterReplId = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb"
 var masterReplOffset = 0
-var replicaConnections []*replicaConnection
+var replicaConnections []net.Conn
 var replicaMu sync.Mutex
 var replicaOffset = 0
 var replicaOffsetMu sync.Mutex
@@ -90,41 +83,37 @@ func startReplica(masterAddr string, replicaPort int) {
 	// Don't defer close here - we need to keep the connection open
 	
 	r := bufio.NewReader(conn)
-	w := bufio.NewWriter(conn)
 
 	// Send PING
-	w.WriteString("*1\r\n$4\r\nPING\r\n")
-	w.Flush()
+	conn.Write([]byte("*1\r\n$4\r\nPING\r\n"))
 	r.ReadString('\n')
 
 	// Send REPLCONF listening-port
 	portStr := strconv.Itoa(replicaPort)
 	replconfPort := fmt.Sprintf("*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$%d\r\n%s\r\n", len(portStr), portStr)
-	w.WriteString(replconfPort)
-	w.Flush()
+	conn.Write([]byte(replconfPort))
 	r.ReadString('\n')
 
 	// Send REPLCONF capa psync2
 	replconfCapa := "*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n"
-	w.WriteString(replconfCapa)
-	w.Flush()
+	conn.Write([]byte(replconfCapa))
 	r.ReadString('\n')
 
 	// Send PSYNC
-	w.WriteString("*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n")
-	w.Flush()
-
+	conn.Write([]byte("*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n"))
+	
 	// Read FULLRESYNC response
 	fullresyncResp, _ := r.ReadString('\n')
 	fmt.Printf("Replica received FULLRESYNC: %s", fullresyncResp)
-
-	// Read RDB file header
-	rdbHeader, _ := r.ReadString('\n')
+	
+	// Read RDB file
+	rdbHeader, _ := r.ReadString('\n') // Read $<length>\r\n
 	fmt.Printf("Replica received RDB header: %s", rdbHeader)
-
-	rdbLenStr := strings.TrimSpace(rdbHeader[1:])
+	
+	// Parse RDB length from header like "$88\r\n"
+	rdbLenStr := strings.TrimSpace(rdbHeader[1:]) // Remove $ and \r\n
 	rdbLen, _ := strconv.Atoi(rdbLenStr)
-
+	
 	// Read the RDB content
 	rdbData := make([]byte, rdbLen)
 	_, err = r.Read(rdbData)
@@ -134,6 +123,7 @@ func startReplica(masterAddr string, replicaPort int) {
 	}
 	fmt.Printf("Replica received RDB data of length: %d\n", len(rdbData))
 
+	// Now listen for propagated commands
 	for {
 		line, err := r.ReadString('\n')
 		if err != nil {
@@ -141,12 +131,13 @@ func startReplica(masterAddr string, replicaPort int) {
 			break
 		}
 		line = strings.TrimSpace(line)
-
+		
 		if strings.HasPrefix(line, "*") {
 			numArgs, _ := strconv.Atoi(line[1:])
 			parts := make([]string, 0, numArgs)
-
-			commandStart := len(line) + 2
+			
+			// Calculate the total bytes for this command for offset tracking
+			commandStart := len(line) + 2 // +2 for \r\n
 			totalCommandBytes := commandStart
 
 			for i := 0; i < numArgs; i++ {
@@ -155,7 +146,7 @@ func startReplica(masterAddr string, replicaPort int) {
 					return
 				}
 				totalCommandBytes += len(lengthLine)
-
+				
 				arg, err := r.ReadString('\n')
 				if err != nil {
 					return
@@ -167,38 +158,31 @@ func startReplica(masterAddr string, replicaPort int) {
 			if len(parts) > 0 {
 				cmd := strings.ToUpper(parts[0])
 				fmt.Printf("Replica received propagated command: %v (bytes: %d)\n", parts, totalCommandBytes)
-
+				
+				// Handle REPLCONF GETACK before updating offset
 				if cmd == "REPLCONF" && len(parts) >= 3 && strings.ToUpper(parts[1]) == "GETACK" {
-	replicaOffsetMu.Lock()
-	currentOffset := replicaOffset
-	replicaOffsetMu.Unlock()
-
-	offsetStr := strconv.Itoa(currentOffset)
-	response := fmt.Sprintf("*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$%d\r\n%s\r\n", len(offsetStr), offsetStr)
-
-	fmt.Printf("[REPLICA] Preparing ACK for offset %d: %q\n", currentOffset, response)
-	_, err := w.WriteString(response)
-	if err != nil {
-		fmt.Printf("[REPLICA] ERROR writing ACK: %v\n", err)
-	}
-	err = w.Flush()
-	if err != nil {
-		fmt.Printf("[REPLICA] ERROR flushing ACK: %v\n", err)
-	} else {
-		fmt.Printf("[REPLICA] ACK successfully flushed for offset %d\n", currentOffset)
-	}
-
-
-
-	replicaOffsetMu.Lock()
-	replicaOffset += totalCommandBytes
-	replicaOffsetMu.Unlock()
-} else {
-	switch cmd {
-	case "SET":
-		if len(parts) >= 3 {
-			key := parts[1]
-			val := parts[2]
+					// Get current offset BEFORE processing this command
+					replicaOffsetMu.Lock()
+					currentOffset := replicaOffset
+					replicaOffsetMu.Unlock()
+					
+					// Respond with current offset (excluding this GETACK command)
+					offsetStr := strconv.Itoa(currentOffset)
+					response := fmt.Sprintf("*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$%d\r\n%s\r\n", len(offsetStr), offsetStr)
+					conn.Write([]byte(response))
+					fmt.Printf("Replica sent ACK response with offset: %d\n", currentOffset)
+					
+					// Update offset after responding
+					replicaOffsetMu.Lock()
+					replicaOffset += totalCommandBytes
+					replicaOffsetMu.Unlock()
+				} else {
+					// For all other commands, process them and then update offset
+					switch cmd {
+					case "SET":
+						if len(parts) >= 3 {
+							key := parts[1]
+							val := parts[2]
 							var expireAt time.Time
 							if len(parts) == 5 && strings.ToUpper(parts[3]) == "PX" {
 								ms, err := strconv.Atoi(parts[4])
@@ -212,9 +196,11 @@ func startReplica(masterAddr string, replicaPort int) {
 							fmt.Printf("Replica stored: %s = %s\n", key, val)
 						}
 					case "PING":
+						// Just process silently, no response needed
 						fmt.Printf("Replica processed PING\n")
 					}
-
+					
+					// Update offset after processing
 					replicaOffsetMu.Lock()
 					replicaOffset += totalCommandBytes
 					replicaOffsetMu.Unlock()
@@ -223,21 +209,13 @@ func startReplica(masterAddr string, replicaPort int) {
 			}
 		}
 	}
-
+	
 	conn.Close()
 }
 
-
 func handleConnection(conn net.Conn) {
+	defer conn.Close()
 	reader := bufio.NewReader(conn)
-	isReplicaConn := false
-
-	defer func() {
-		conn.Close()
-		if isReplicaConn {
-			removeReplicaConnection(conn)
-		}
-	}()
 
 	for {
 		line, err := reader.ReadString('\n')
@@ -361,24 +339,20 @@ func handleConnection(conn net.Conn) {
 				}
 
 			case "WAIT":
-				if len(parts) >= 3 {
-					numReplicas, _ := strconv.Atoi(parts[1])
-					timeoutMs, _ := strconv.Atoi(parts[2])
-					
-					ackCount := waitForReplicas(numReplicas, timeoutMs)
-					resp := fmt.Sprintf(":%d\r\n", ackCount)
-					conn.Write([]byte(resp))
-				} else {
-					conn.Write([]byte("-ERR wrong number of arguments for 'wait' command\r\n"))
-				}
+				// WAIT command: WAIT <numreplicas> <timeout>
+				// Return the number of connected replicas
+				replicaMu.Lock()
+				numReplicas := len(replicaConnections)
+				replicaMu.Unlock()
+				
+				resp := fmt.Sprintf(":%d\r\n", numReplicas)
+				conn.Write([]byte(resp))
 
 			case "REPLCONF":
 				conn.Write([]byte("+OK\r\n"))
 				
 			case "PSYNC":
 				if len(parts) == 3 && parts[1] == "?" && parts[2] == "-1" {
-					isReplicaConn = true
-					
 					// 1. Send FULLRESYNC line
 					fullResync := fmt.Sprintf("+FULLRESYNC %s %d\r\n", masterReplId, masterReplOffset)
 					conn.Write([]byte(fullResync))
@@ -391,7 +365,6 @@ func handleConnection(conn net.Conn) {
 						0x00, 0x00,
 						0x00, 0x00,
 						0x00, 0x00,
-						0x00, 0x00,
 					}
 
 					// 3. Send RESP-like bulk string header (without trailing \r\n in content)
@@ -400,10 +373,7 @@ func handleConnection(conn net.Conn) {
 					conn.Write(emptyRDB) // no trailing \r\n after content
 					
 					replicaMu.Lock()
-					replicaConnections = append(replicaConnections, &replicaConnection{
-						conn:   conn,
-						reader: reader,
-					})
+					replicaConnections = append(replicaConnections, conn)
 					replicaMu.Unlock()
 				} else {
 					conn.Write([]byte("-ERR unsupported PSYNC format\r\n"))
@@ -412,108 +382,6 @@ func handleConnection(conn net.Conn) {
 			default:
 				conn.Write([]byte("-ERR unknown command\r\n"))
 			}
-		}
-	}
-}
-
-
-
-
-func waitForReplicas(numReplicas int, timeoutMs int) int {
-    replicaMu.Lock()
-    replicas := make([]*replicaConnection, len(replicaConnections))
-    copy(replicas, replicaConnections)
-    replicaMu.Unlock()
-
-    if len(replicas) == 0 {
-        return 0
-    }
-
-    if numReplicas <= 0 {
-        return len(replicas)
-    }
-
-    fmt.Printf("waitForReplicas called with timeoutMs: %d, numReplicas: %d\n", timeoutMs, numReplicas)
-
-    // Send REPLCONF GETACK * to all replicas
-    getackCmd := "*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n"
-    ackChan := make(chan struct{}, len(replicas))
-    timeout := time.After(time.Duration(timeoutMs) * time.Millisecond)
-
-    for _, replica := range replicas {
-        go func(r *replicaConnection) {
-            r.mu.Lock()
-            defer r.mu.Unlock()
-
-            // Write GETACK command
-            _, err := r.conn.Write([]byte(getackCmd))
-            if err != nil {
-                fmt.Printf("Error sending GETACK to replica: %v\n", err)
-                return
-            }
-
-            // Set read deadline
-            if err := r.conn.SetReadDeadline(time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)); err != nil {
-                fmt.Printf("Error setting read deadline: %v\n", err)
-                return
-            }
-            defer r.conn.SetReadDeadline(time.Time{})
-
-            // Read directly from the connection
-            buf := make([]byte, 1024)
-            data := ""
-            for {
-                n, err := r.conn.Read(buf)
-                if err != nil {
-                    if err == io.EOF || strings.Contains(err.Error(), "use of closed network connection") {
-                        fmt.Printf("Connection closed or EOF while reading from replica: %v, data so far: %q\n", err, data)
-                    } else if strings.Contains(err.Error(), "i/o timeout") {
-                        fmt.Printf("Read timeout from replica: %v, data so far: %q\n", err, data)
-                    } else {
-                        fmt.Printf("Error reading from replica: %v, data so far: %q\n", err, data)
-                    }
-                    return
-                }
-
-                data += string(buf[:n])
-                fmt.Printf("Data received from replica: %q\n", string(buf[:n]))
-                if strings.Contains(data, "ACK") {
-                    fmt.Printf("ACK received from replica: %q\n", data)
-                    select {
-                    case ackChan <- struct{}{}:
-                    default:
-                    }
-                    return
-                }
-            }
-        }(replica)
-    }
-
-    // Count ACKs until we reach the desired number or timeout
-    ackCount := 0
-    for {
-        select {
-        case <-ackChan:
-            ackCount++
-            fmt.Printf("Processed ACK, total: %d\n", ackCount)
-            if ackCount >= numReplicas {
-                return ackCount
-            }
-        case <-timeout:
-            fmt.Printf("Timeout reached after %dms, received %d ACKs\n", timeoutMs, ackCount)
-            return ackCount
-        }
-    }
-}
-
-func removeReplicaConnection(conn net.Conn) {
-	replicaMu.Lock()
-	defer replicaMu.Unlock()
-	
-	for i, replica := range replicaConnections {
-		if replica.conn == conn {
-			replicaConnections = append(replicaConnections[:i], replicaConnections[i+1:]...)
-			break
 		}
 	}
 }
@@ -655,9 +523,7 @@ func propagateToReplicas(parts []string) {
 	}
 	data := []byte(builder.String())
 
-	for _, replica := range replicaConnections {
-		replica.mu.Lock()
-		replica.conn.Write(data)
-		replica.mu.Unlock()
+	for _, rconn := range replicaConnections {
+		rconn.Write(data)
 	}
 }
