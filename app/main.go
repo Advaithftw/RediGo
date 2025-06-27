@@ -243,11 +243,6 @@ func handleConnection(conn net.Conn) {
 
 			cmd := strings.ToUpper(parts[0])
 
-			replicaOffsetMu.Lock()
-replicaOffset += totalCommandBytes
-replicaOffsetMu.Unlock()
-
-
 			switch cmd {
 			case "PING":
 				conn.Write([]byte("+PONG\r\n"))
@@ -380,18 +375,6 @@ replicaOffsetMu.Unlock()
 					replicaMu.Lock()
 					replicaConnections = append(replicaConnections, conn)
 					replicaMu.Unlock()
-					go func(conn net.Conn) {
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-	for range ticker.C {
-		_, err := conn.Write([]byte("*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n"))
-		if err != nil {
-			fmt.Println("Failed to send GETACK to replica:", err)
-			return
-		}
-	}
-}(conn)
-
 				} else {
 					conn.Write([]byte("-ERR unsupported PSYNC format\r\n"))
 				}
