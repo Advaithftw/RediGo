@@ -383,7 +383,8 @@ if !isReplica {
 					conn.Write(emptyRDB) // no trailing \r\n after content
 					
 					replicaMu.Lock()
-					replicaConnections = append(replicaConnections, conn)
+					replicaConnections = append(replicaConnections, replica{conn: conn, ack: 0}) // ✅ correct
+
 					replicaMu.Unlock()
 				} else {
 					conn.Write([]byte("-ERR unsupported PSYNC format\r\n"))
@@ -534,6 +535,7 @@ func propagateToReplicas(parts []string) {
 	data := []byte(builder.String())
 
 	for _, rconn := range replicaConnections {
-		rconn.Write(data)
+		rconn.conn.Write(data)
+
 	}
 }
