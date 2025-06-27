@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"encoding/binary"
 )
 
 type entry struct {
