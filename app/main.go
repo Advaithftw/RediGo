@@ -18,12 +18,6 @@ type entry struct {
 	expireAt time.Time
 }
 
-type replicaConnection struct {
-	conn   net.Conn
-	reader *bufio.Reader
-	mu     sync.Mutex
-}
-
 var store = make(map[string]entry)
 var mu sync.RWMutex
 
@@ -32,7 +26,7 @@ var configFilename string
 var isReplica bool
 var masterReplId = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb"
 var masterReplOffset = 0
-var replicaConnections []*replicaConnection
+var replicaConnections []net.Conn
 var replicaMu sync.Mutex
 var replicaOffset = 0
 var replicaOffsetMu sync.Mutex
@@ -345,16 +339,14 @@ func handleConnection(conn net.Conn) {
 				}
 
 			case "WAIT":
-				if len(parts) >= 3 {
-					expectedReplicas, _ := strconv.Atoi(parts[1])
-					timeoutMs, _ := strconv.Atoi(parts[2])
-					
-					count := handleWait(expectedReplicas, timeoutMs)
-					resp := fmt.Sprintf(":%d\r\n", count)
-					conn.Write([]byte(resp))
-				} else {
-					conn.Write([]byte("-ERR wrong number of arguments for 'wait' command\r\n"))
-				}
+				// WAIT command: WAIT <numreplicas> <timeout>
+				// Return the number of connected replicas
+				replicaMu.Lock()
+				numReplicas := len(replicaConnections)
+				replicaMu.Unlock()
+				
+				resp := fmt.Sprintf(":%d\r\n", numReplicas)
+				conn.Write([]byte(resp))
 
 			case "REPLCONF":
 				conn.Write([]byte("+OK\r\n"))
@@ -381,10 +373,7 @@ func handleConnection(conn net.Conn) {
 					conn.Write(emptyRDB) // no trailing \r\n after content
 					
 					replicaMu.Lock()
-					replicaConnections = append(replicaConnections, &replicaConnection{
-						conn:   conn,
-						reader: reader,
-					})
+					replicaConnections = append(replicaConnections, conn)
 					replicaMu.Unlock()
 				} else {
 					conn.Write([]byte("-ERR unsupported PSYNC format\r\n"))
@@ -395,130 +384,6 @@ func handleConnection(conn net.Conn) {
 			}
 		}
 	}
-}
-
-func handleWait(expectedReplicas int, timeoutMs int) int {
-	if expectedReplicas == 0 {
-		return 0
-	}
-
-	replicaMu.Lock()
-	if len(replicaConnections) == 0 {
-		replicaMu.Unlock()
-		return 0
-	}
-	
-	// Make a copy of connections to work with
-	replicas := make([]*replicaConnection, len(replicaConnections))
-	copy(replicas, replicaConnections)
-	replicaMu.Unlock()
-
-	// Channel to collect responses
-	responseChan := make(chan int, len(replicas))
-	
-	// Send GETACK to all replicas
-	for i, replica := range replicas {
-		go func(idx int, r *replicaConnection) {
-			r.mu.Lock()
-			defer r.mu.Unlock()
-			
-			// Send REPLCONF GETACK *
-			getackCmd := "*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n"
-			_, err := r.conn.Write([]byte(getackCmd))
-			if err != nil {
-				responseChan <- -1 // Error indicator
-				return
-			}
-			
-			// Try to read response
-			r.conn.SetReadDeadline(time.Now().Add(time.Duration(timeoutMs) * time.Millisecond))
-			
-			// Read response: *3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$<len>\r\n<offset>\r\n
-			line, err := r.reader.ReadString('\n')
-			if err != nil {
-				responseChan <- -1
-				return
-			}
-			
-			if !strings.HasPrefix(strings.TrimSpace(line), "*3") {
-				responseChan <- -1
-				return
-			}
-			
-			// Skip REPLCONF line
-			_, err = r.reader.ReadString('\n') // $8
-			if err != nil {
-				responseChan <- -1
-				return
-			}
-			_, err = r.reader.ReadString('\n') // REPLCONF
-			if err != nil {
-				responseChan <- -1
-				return
-			}
-			
-			// Skip ACK line
-			_, err = r.reader.ReadString('\n') // $3
-			if err != nil {
-				responseChan <- -1
-				return
-			}
-			_, err = r.reader.ReadString('\n') // ACK
-			if err != nil {
-				responseChan <- -1
-				return
-			}
-			
-			// Read offset length
-			offsetLenLine, err := r.reader.ReadString('\n')
-			if err != nil {
-				responseChan <- -1
-				return
-			}
-			
-			// Read offset value
-			offsetLine, err := r.reader.ReadString('\n')
-			if err != nil {
-				responseChan <- -1
-				return
-			}
-			
-			offset, err := strconv.Atoi(strings.TrimSpace(offsetLine))
-			if err != nil {
-				responseChan <- -1
-				return
-			}
-			
-			// Check if replica is up to date (offset >= masterReplOffset)
-			if offset >= masterReplOffset {
-				responseChan <- 1 // Success
-			} else {
-				responseChan <- 0 // Not up to date
-			}
-		}(i, replica)
-	}
-	
-	// Wait for responses or timeout
-	timeout := time.After(time.Duration(timeoutMs) * time.Millisecond)
-	acknowledgedCount := 0
-	responseCount := 0
-	
-	for responseCount < len(replicas) {
-		select {
-		case result := <-responseChan:
-			responseCount++
-			if result == 1 {
-				acknowledgedCount++
-				if acknowledgedCount >= expectedReplicas {
-					return acknowledgedCount
-				}
-			}
-		case <-timeout:
-			return acknowledgedCount
-		}
-	}
-	
-	return acknowledgedCount
 }
 
 // Load RDB file with proper expiry handling
@@ -658,10 +523,7 @@ func propagateToReplicas(parts []string) {
 	}
 	data := []byte(builder.String())
 
-	// Update master offset
-	masterReplOffset += len(data)
-
-	for _, replica := range replicaConnections {
-		replica.conn.Write(data)
+	for _, rconn := range replicaConnections {
+		rconn.Write(data)
 	}
 }
