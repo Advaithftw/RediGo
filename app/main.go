@@ -148,7 +148,14 @@ func startReplica(masterAddr string, replicaPort int) {
 }
 
 func handleConnection(conn net.Conn) {
-	defer conn.Close()
+	var isReplicaConn bool
+
+	
+	defer func() {
+		if !isReplicaConn {
+			conn.Close()
+		}
+	}()
 	reader := bufio.NewReader(conn)
 
 	for {
