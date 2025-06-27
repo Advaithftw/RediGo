@@ -429,6 +429,7 @@ func waitForReplicas(numReplicas int, timeoutMs int) int {
 		replica.mu.Unlock()
 		if err != nil {
 			fmt.Printf("Error sending GETACK to replica: %v\n", err)
+			continue
 		}
 	}
 
@@ -443,25 +444,35 @@ func waitForReplicas(numReplicas int, timeoutMs int) int {
 			defer r.mu.Unlock()
 
 			// Set a read deadline
-			r.conn.SetReadDeadline(time.Now().Add(time.Duration(timeoutMs) * time.Millisecond))
+			err := r.conn.SetReadDeadline(time.Now().Add(time.Duration(timeoutMs) * time.Millisecond))
+			if err != nil {
+				fmt.Printf("Error setting read deadline: %v\n", err)
+				return
+			}
 			defer r.conn.SetReadDeadline(time.Time{})
 
-			// Create a new bufio.Reader to ensure clean state
+			// Create a new bufio.Reader
 			reader := bufio.NewReader(r.conn)
 
-			// Read until we find an ACK response
+			// Read response with a buffer to handle partial data
+			buf := make([]byte, 1024)
 			for {
-				line, err := reader.ReadString('\n')
+				n, err := reader.Read(buf)
 				if err != nil {
-					fmt.Printf("Error reading from replica: %v\n", err)
+					if err == io.EOF || strings.Contains(err.Error(), "use of closed network connection") {
+						fmt.Printf("Connection closed or EOF while reading from replica: %v\n", err)
+					} else {
+						fmt.Printf("Error reading from replica: %v\n", err)
+					}
 					return
 				}
 
-				// Look for the ACK command in the response
-				if strings.Contains(line, "ACK") {
+				// Convert buffer to string and check for ACK
+				data := string(buf[:n])
+				if strings.Contains(data, "ACK") {
+					fmt.Printf("ACK received from replica: %s\n", data)
 					select {
 					case ackChan <- struct{}{}:
-						fmt.Println("ACK received from replica")
 					default:
 					}
 					return
@@ -476,11 +487,12 @@ func waitForReplicas(numReplicas int, timeoutMs int) int {
 		select {
 		case <-ackChan:
 			ackCount++
+			fmt.Printf("Processed ACK, total: %d\n", ackCount)
 			if ackCount >= numReplicas {
 				return ackCount
 			}
 		case <-timeout:
-			fmt.Printf("Timeout reached, received %d ACKs\n", ackCount)
+			fmt.Printf("Timeout reached after %dms, received %d ACKs\n", timeoutMs, ackCount)
 			return ackCount
 		}
 	}
