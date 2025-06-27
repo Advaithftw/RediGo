@@ -408,14 +408,6 @@ func handleConnection(conn net.Conn) {
 	}
 }
 
-import (
-    "bufio"
-    "fmt"
-    "io"
-    "strings"
-    "time"
-    "net"
-)
 
 func waitForReplicas(numReplicas int, timeoutMs int) int {
 	replicaMu.Lock()
