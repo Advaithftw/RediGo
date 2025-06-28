@@ -19,9 +19,11 @@ type entry struct {
 }
 
 type replicaConn struct {
-	conn   net.Conn
-	offset int
-	mu     sync.Mutex
+	conn     net.Conn
+	offset   int
+	mu       sync.Mutex
+	ackChan  chan int
+	isReplica bool
 }
 
 var store = make(map[string]entry)
@@ -221,7 +223,20 @@ func startReplica(masterAddr string, replicaPort int) {
 }
 
 func handleConnection(conn net.Conn) {
-	defer conn.Close()
+	defer func() {
+		conn.Close()
+		// Remove this connection from replica list if it was a replica
+		replicaMu.Lock()
+		newConnections := make([]*replicaConn, 0, len(replicaConnections))
+		for _, replica := range replicaConnections {
+			if replica.conn != conn {
+				newConnections = append(newConnections, replica)
+			}
+		}
+		replicaConnections = newConnections
+		replicaMu.Unlock()
+	}()
+	
 	reader := bufio.NewReader(conn)
 
 	for {
@@ -360,9 +375,23 @@ func handleConnection(conn net.Conn) {
 				}
 
 			case "REPLCONF":
-				if len(parts) >= 2 && strings.ToUpper(parts[1]) == "ACK" {
-					// This is an ACK response from a replica - don't send OK
-					// The WAIT command handler will process this
+				if len(parts) >= 2 && strings.ToUpper(parts[1]) == "ACK" && len(parts) >= 3 {
+					// This is an ACK response from a replica
+					offset, err := strconv.Atoi(parts[2])
+					if err == nil {
+						// Find the replica and send the offset to its channel
+						replicaMu.Lock()
+						for _, replica := range replicaConnections {
+							if replica.conn == conn {
+								select {
+								case replica.ackChan <- offset:
+								default:
+								}
+								break
+							}
+						}
+						replicaMu.Unlock()
+					}
 				} else {
 					conn.Write([]byte("+OK\r\n"))
 				}
@@ -391,7 +420,12 @@ func handleConnection(conn net.Conn) {
 					conn.Write(emptyRDB) // no trailing \r\n after content
 					
 					replicaMu.Lock()
-					replica := &replicaConn{conn: conn, offset: 0}
+					replica := &replicaConn{
+						conn:      conn,
+						offset:    0,
+						ackChan:   make(chan int, 1),
+						isReplica: true,
+					}
 					replicaConnections = append(replicaConnections, replica)
 					replicaMu.Unlock()
 				} else {
@@ -447,54 +481,12 @@ func waitForReplicas(numReplicas int, timeoutMs int) int {
 	timeout := time.NewTimer(time.Duration(timeoutMs) * time.Millisecond)
 	defer timeout.Stop()
 
-	responseChan := make(chan bool, len(activeReplicas))
-	
-	// Start goroutines to read ACK responses
-	for _, replica := range activeReplicas {
-		go func(r *replicaConn) {
-			reader := bufio.NewReader(r.conn)
-			r.conn.SetReadDeadline(time.Now().Add(time.Duration(timeoutMs) * time.Millisecond))
-			
-			line, err := reader.ReadString('\n')
-			if err != nil {
-				responseChan <- false
-				return
-			}
-			
-			if strings.HasPrefix(strings.TrimSpace(line), "*") {
-				// Read the ACK response: *3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$<len>\r\n<offset>\r\n
-				for i := 0; i < 3; i++ {
-					reader.ReadString('\n') // Skip command parts
-				}
-				offsetLine, err := reader.ReadString('\n')
-				if err != nil {
-					responseChan <- false
-					return
-				}
-				
-				replicaOffset, err := strconv.Atoi(strings.TrimSpace(offsetLine))
-				if err != nil {
-					responseChan <- false
-					return
-				}
-				
-				// Check if replica is caught up
-				if replicaOffset >= currentOffset {
-					responseChan <- true
-				} else {
-					responseChan <- false
-				}
-			} else {
-				responseChan <- false
-			}
-		}(replica)
-	}
-
 	// Wait for responses or timeout
 	for i := 0; i < len(activeReplicas); i++ {
 		select {
-		case ack := <-responseChan:
-			if ack {
+		case replicaOffset := <-activeReplicas[i].ackChan:
+			// Check if replica is caught up
+			if replicaOffset >= currentOffset {
 				ackCount++
 				if ackCount >= numReplicas {
 					return ackCount
