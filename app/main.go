@@ -297,7 +297,7 @@ func handleConnection(conn net.Conn) {
 				// ✅ Track last write and propagate if master
 				if !isReplica {
 					propagateToReplicas(parts)
-					lastWrite = true
+					
 				}
 
 			case "GET":
