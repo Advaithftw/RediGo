@@ -232,8 +232,9 @@ func handleConnection(conn net.Conn) {
 		replicaConnections = newConnections
 		replicaMu.Unlock()
 	}()
-	
+
 	reader := bufio.NewReader(conn)
+	var lastWrite bool // ✅ Added
 
 	for {
 		line, err := reader.ReadString('\n')
@@ -247,7 +248,10 @@ func handleConnection(conn net.Conn) {
 			parts := make([]string, 0, numArgs)
 
 			for i := 0; i < numArgs; i++ {
-				reader.ReadString('\n') // skip $<len>
+				_, err := reader.ReadString('\n') // skip $<len>
+				if err != nil {
+					return
+				}
 				arg, err := reader.ReadString('\n')
 				if err != nil {
 					return
@@ -273,6 +277,10 @@ func handleConnection(conn net.Conn) {
 				}
 
 			case "SET":
+				if len(parts) < 3 {
+					conn.Write([]byte("-ERR wrong number of arguments for 'set'\r\n"))
+					continue
+				}
 				key := parts[1]
 				val := parts[2]
 				var expireAt time.Time
@@ -286,13 +294,18 @@ func handleConnection(conn net.Conn) {
 				store[key] = entry{value: val, expireAt: expireAt}
 				mu.Unlock()
 				conn.Write([]byte("+OK\r\n"))
-				
-				// Only propagate if this is the master
+
+				// ✅ Track last write and propagate if master
 				if !isReplica {
 					propagateToReplicas(parts)
+					lastWrite = true
 				}
 
 			case "GET":
+				if len(parts) < 2 {
+					conn.Write([]byte("-ERR wrong number of arguments for 'get'\r\n"))
+					continue
+				}
 				key := parts[1]
 				mu.RLock()
 				e, exists := store[key]
@@ -362,20 +375,23 @@ func handleConnection(conn net.Conn) {
 				if len(parts) >= 3 {
 					numReplicas, _ := strconv.Atoi(parts[1])
 					timeoutMs, _ := strconv.Atoi(parts[2])
-					
-					ackCount := waitForReplicas(numReplicas, timeoutMs)
-					resp := fmt.Sprintf(":%d\r\n", ackCount)
-					conn.Write([]byte(resp))
+
+					if lastWrite { // ✅ Only if a write happened
+						ackCount := waitForReplicas(numReplicas, timeoutMs)
+						resp := fmt.Sprintf(":%d\r\n", ackCount)
+						conn.Write([]byte(resp))
+						lastWrite = false // ✅ Reset after WAIT
+					} else {
+						conn.Write([]byte(":0\r\n")) // ✅ No write, return 0
+					}
 				} else {
 					conn.Write([]byte("-ERR wrong number of arguments for 'wait' command\r\n"))
 				}
 
 			case "REPLCONF":
-				if len(parts) >= 2 && strings.ToUpper(parts[1]) == "ACK" && len(parts) >= 3 {
-					// This is an ACK response from a replica
+				if len(parts) >= 3 && strings.ToUpper(parts[1]) == "ACK" {
 					offset, err := strconv.Atoi(parts[2])
 					if err == nil {
-						// Find the replica and send the offset to its channel
 						replicaMu.Lock()
 						for _, replica := range replicaConnections {
 							if replica.conn == conn {
@@ -393,30 +409,21 @@ func handleConnection(conn net.Conn) {
 				} else {
 					conn.Write([]byte("+OK\r\n"))
 				}
-				
+
 			case "PSYNC":
 				if len(parts) == 3 && parts[1] == "?" && parts[2] == "-1" {
-					// 1. Send FULLRESYNC line
 					masterReplOffsetMu.Lock()
 					fullResync := fmt.Sprintf("+FULLRESYNC %s %d\r\n", masterReplId, masterReplOffset)
 					masterReplOffsetMu.Unlock()
 					conn.Write([]byte(fullResync))
 
-					// 2. Prepare empty RDB file bytes
 					emptyRDB := []byte{
-						0x52, 0x45, 0x44, 0x49, 0x53, 0x30, 0x30, 0x30, 0x37, // "REDIS0007"
-						0xFF, // End of file opcode
-						0x00, 0x00, // Checksum (placeholder, still accepted)
-						0x00, 0x00,
-						0x00, 0x00,
-						0x00, 0x00,
+						0x52, 0x45, 0x44, 0x49, 0x53, 0x30, 0x30, 0x30, 0x37,
+						0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 					}
+					conn.Write([]byte(fmt.Sprintf("$%d\r\n", len(emptyRDB))))
+					conn.Write(emptyRDB)
 
-					// 3. Send RESP-like bulk string header (without trailing \r\n in content)
-					rdbLen := len(emptyRDB)
-					conn.Write([]byte(fmt.Sprintf("$%d\r\n", rdbLen)))
-					conn.Write(emptyRDB) // no trailing \r\n after content
-					
 					replicaMu.Lock()
 					replica := &replicaConn{
 						conn:      conn,
@@ -436,6 +443,7 @@ func handleConnection(conn net.Conn) {
 		}
 	}
 }
+
 
 func waitForReplicas(numReplicas int, timeoutMs int) int {
 	if numReplicas == 0 {
