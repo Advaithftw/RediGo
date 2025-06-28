@@ -138,14 +138,16 @@ func startReplica(masterAddr string, replicaPort int) {
 			fmt.Println("Replica connection closed:", err)
 			break
 		}
+		
+		originalLine := line // Keep original for byte counting
 		line = strings.TrimSpace(line)
 		
 		if strings.HasPrefix(line, "*") {
 			numArgs, _ := strconv.Atoi(line[1:])
 			parts := make([]string, 0, numArgs)
 			
-			// Calculate the total bytes for this command for offset tracking
-			commandBytes := len(line) + 2 // +2 for \r\n
+			// Start with the command line bytes
+			commandBytes := len(originalLine)
 
 			for i := 0; i < numArgs; i++ {
 				lengthLine, err := r.ReadString('\n')
@@ -294,10 +296,9 @@ func handleConnection(conn net.Conn) {
 				mu.Unlock()
 				conn.Write([]byte("+OK\r\n"))
 
-				// ✅ Track last write and propagate if master
+				// Track last write and propagate if master
 				if !isReplica {
 					propagateToReplicas(parts)
-					
 				}
 
 			case "GET":
@@ -376,7 +377,7 @@ func handleConnection(conn net.Conn) {
 					timeoutMs, _ := strconv.Atoi(parts[2])
 
 					ackCount := waitForReplicas(numReplicas, timeoutMs)
-conn.Write([]byte(fmt.Sprintf(":%d\r\n", ackCount)))
+					conn.Write([]byte(fmt.Sprintf(":%d\r\n", ackCount)))
 
 				} else {
 					conn.Write([]byte("-ERR wrong number of arguments for 'wait' command\r\n"))
@@ -503,7 +504,6 @@ func waitForReplicas(numReplicas int, timeoutMs int) int {
 
 	return ackCount
 }
-
 
 // Load RDB file with proper expiry handling
 func loadRDB(path string) {
