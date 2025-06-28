@@ -233,12 +233,12 @@ for {
     } else {
         fmt.Printf("Invalid command format, expected '*', got: %s\n", line)
     }
-} else {
-		// For all other commands, process them and then update offset
-		switch cmd {
-		case "SET":
-			if len(parts) >= 3 {
-				key := parts[1]
+}else {
+					// For all other commands, process them and then update offset
+					switch cmd {
+					case "SET":
+						if len(parts) >= 3 {
+							key := parts[1]
 							val := parts[2]
 							var expireAt time.Time
 							if len(parts) == 5 && strings.ToUpper(parts[3]) == "PX" {
