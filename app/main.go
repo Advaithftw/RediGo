@@ -234,7 +234,7 @@ func handleConnection(conn net.Conn) {
 	}()
 
 	reader := bufio.NewReader(conn)
-	var lastWrite bool // ✅ Added
+
 
 	for {
 		line, err := reader.ReadString('\n')
