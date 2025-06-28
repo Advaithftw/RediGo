@@ -438,68 +438,72 @@ conn.Write([]byte(fmt.Sprintf(":%d\r\n", ackCount)))
 	}
 }
 
-
 func waitForReplicas(numReplicas int, timeoutMs int) int {
 	if numReplicas == 0 {
 		return 0
 	}
 
 	replicaMu.Lock()
-	fmt.Printf("WAIT: %d replicas connected\n", len(replicaConnections))
 	if len(replicaConnections) == 0 {
 		replicaMu.Unlock()
 		return 0
 	}
 
-	// Get current master offset before sending GETACK
 	masterReplOffsetMu.Lock()
 	expectedOffset := masterReplOffset
 	masterReplOffsetMu.Unlock()
 
-	// Send GETACK to all replicas
 	getackCmd := "*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n"
 	activeReplicas := make([]*replicaConn, 0, len(replicaConnections))
-	
+
 	for _, replica := range replicaConnections {
 		_, err := replica.conn.Write([]byte(getackCmd))
-		if err != nil {
-			fmt.Printf("Failed to send GETACK to replica: %v\n", err)
-			continue
+		if err == nil {
+			activeReplicas = append(activeReplicas, replica)
 		}
-		activeReplicas = append(activeReplicas, replica)
 	}
-	
-	// Update the list with only active replicas
 	replicaConnections = activeReplicas
 	replicaMu.Unlock()
 
 	if len(activeReplicas) == 0 {
-		fmt.Println("No active replicas after sending GETACK")
 		return 0
 	}
 
-	// Wait for ACK responses
+	timeout := time.After(time.Duration(timeoutMs) * time.Millisecond)
 	ackCount := 0
-	timeout := time.NewTimer(time.Duration(timeoutMs) * time.Millisecond)
-	defer timeout.Stop()
+	received := make(chan int, len(activeReplicas))
 
-	for i := 0; i < len(activeReplicas) && i < numReplicas; i++ {
-		select {
-		case replicaOffset := <-activeReplicas[i].ackChan:
-			fmt.Printf("Received ACK from replica with offset: %d (expected: %d)\n", replicaOffset, expectedOffset)
-			// Check if replica is caught up (allow exact match)
-			if replicaOffset >= expectedOffset {
-				ackCount++
+	// Fan-in all replica responses
+	for _, replica := range activeReplicas {
+		go func(r *replicaConn) {
+			select {
+			case offset := <-r.ackChan:
+				if offset >= expectedOffset {
+					received <- 1
+				} else {
+					received <- 0
+				}
+			case <-timeout:
+				received <- 0
 			}
-		case <-timeout.C:
-			fmt.Printf("WAIT timeout reached, ackCount: %d\n", ackCount)
+		}(replica)
+	}
+
+	for i := 0; i < len(activeReplicas); i++ {
+		select {
+		case ack := <-received:
+			ackCount += ack
+			if ackCount >= numReplicas {
+				return ackCount
+			}
+		case <-timeout:
 			return ackCount
 		}
 	}
 
-	fmt.Printf("WAIT completed, ackCount: %d\n", ackCount)
 	return ackCount
 }
+
 
 // Load RDB file with proper expiry handling
 func loadRDB(path string) {
