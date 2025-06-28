@@ -467,89 +467,80 @@ func handleConnection(conn net.Conn) {
 }
 
 func waitForReplicas(numReplicas int, timeoutMs int) int {
-	if numReplicas == 0 {
-		return 0
-	}
+    replicaMu.Lock()
+    if len(replicaConnections) == 0 {
+        replicaMu.Unlock()
+        return 0
+    }
 
-	replicaMu.Lock()
-	if len(replicaConnections) == 0 {
-		replicaMu.Unlock()
-		return 0
-	}
+    // Get the current master offset
+    masterReplOffsetMu.Lock()
+    expectedOffset := masterReplOffset
+    masterReplOffsetMu.Unlock()
 
-	// Check if there have been any writes since last check
-	lastWriteOffsetMu.Lock()
-	masterReplOffsetMu.Lock()
-	expectedOffset := masterReplOffset
-	hasRecentWrites := lastWriteOffset < masterReplOffset
-	masterReplOffsetMu.Unlock()
-	lastWriteOffsetMu.Unlock()
+    // Send GETACK to all replicas
+    getackCmd := "*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n"
+    activeReplicas := make([]*replicaConn, 0, len(replicaConnections))
 
-	// If no recent writes, return current replica count immediately
-	if !hasRecentWrites {
-		replicaCount := len(replicaConnections)
-		replicaMu.Unlock()
-		if replicaCount >= numReplicas {
-			return numReplicas
-		}
-		return replicaCount
-	}
+    // Filter out dead connections while sending GETACK
+    for _, replica := range replicaConnections {
+        err := writeToReplicaWithTimeout(replica.conn, []byte(getackCmd), 100*time.Millisecond)
+        if err == nil {
+            activeReplicas = append(activeReplicas, replica)
+        } else {
+            fmt.Printf("Failed to send GETACK to replica: %v\n", err)
+        }
+    }
+    replicaConnections = activeReplicas
+    replicaMu.Unlock()
 
-	// Send GETACK only if there are recent writes
-	getackCmd := "*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n"
-	activeReplicas := make([]*replicaConn, 0, len(replicaConnections))
+    fmt.Printf("Active replicas: %d, required: %d\n", len(activeReplicas), numReplicas)
 
-	// Filter out dead connections while sending GETACK
-	for _, replica := range replicaConnections {
-		err := writeToReplicaWithTimeout(replica.conn, []byte(getackCmd), 100*time.Millisecond)
-		if err == nil {
-			activeReplicas = append(activeReplicas, replica)
-		}
-	}
-	replicaConnections = activeReplicas
-	replicaMu.Unlock()
+    if len(activeReplicas) == 0 {
+        return 0
+    }
 
-	if len(activeReplicas) == 0 {
-		return 0
-	}
+    // Create timeout context
+    ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
+    defer cancel()
 
-	// Create timeout context
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
-	defer cancel()
+    ackCount := 0
+    responseChan := make(chan int, len(activeReplicas))
 
-	ackCount := 0
-	responseChan := make(chan int, len(activeReplicas))
-
-	// Collect responses from all replicas
-	for _, replica := range activeReplicas {
-		go func(r *replicaConn) {
-			select {
-			case offset := <-r.ackChan:
+    // Collect responses from all replicas
+    for _, replica := range activeReplicas {
+        go func(r *replicaConn) {
+            select {
+            case offset := <-r.ackChan:
+                fmt.Printf("Received ACK from replica with offset: %d, expected: %d\n", offset, expectedOffset)
 				if offset >= expectedOffset {
 					responseChan <- 1
 				} else {
 					responseChan <- 0
 				}
-			case <-ctx.Done():
-				responseChan <- 0
-			}
-		}(replica)
-	}
+            case <-ctx.Done():
+                fmt.Printf("Timeout waiting for ACK from replica\n")
+                responseChan <- 0
+            }
+        }(replica)
+    }
 
-	// Wait for responses until we have enough or timeout
-	for i := 0; i < len(activeReplicas); i++ {
-		select {
-		case ack := <-responseChan:
-			ackCount += ack
-			if ackCount >= numReplicas {
-				return ackCount
-			}
-		case <-ctx.Done():
-			return ackCount
-		}
-	}
+    // Wait for responses until we have enough or timeout
+    for i := 0; i < len(activeReplicas); i++ {
+        select {
+        case ack := <-responseChan:
+            ackCount += ack
+            fmt.Printf("Current ack count: %d\n", ackCount)
+            if ackCount >= numReplicas {
+                return ackCount
+            }
+        case <-ctx.Done():
+            fmt.Printf("Timeout reached, final ack count: %d\n", ackCount)
+            return ackCount
+        }
+    }
 
-	return ackCount
+    return ackCount
 }
 
 // Load RDB file with proper expiry handling
