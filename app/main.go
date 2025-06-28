@@ -190,8 +190,7 @@ func startReplica(masterAddr string, replicaPort int) {
 
     fmt.Printf("Replica offset updated to: %d after GETACK\n", currentOffset)
     continue
-}
-else {
+} else {
 					// For all other commands, process them and then update offset
 					switch cmd {
 					case "SET":
