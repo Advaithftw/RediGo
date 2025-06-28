@@ -2,7 +2,7 @@ package main
 
 import (
 	"bufio"
-	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"flag"
 	"fmt"
@@ -19,29 +19,409 @@ type entry struct {
 	expireAt time.Time
 }
 
-type replicaConn struct {
-	conn     net.Conn
-	offset   int
-	mu       sync.Mutex
-	ackChan  chan int
-	isReplica bool
+type Storage struct {
+	data map[string]entry
+	mu   sync.RWMutex
 }
 
-var store = make(map[string]entry)
-var mu sync.RWMutex
+func (s *Storage) get(key string) (string, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	e, exists := s.data[key]
+	if !exists || (!e.expireAt.IsZero() && time.Now().After(e.expireAt)) {
+		return "", false
+	}
+	return e.value, true
+}
 
-var configDir string
-var configFilename string
-var isReplica bool
-var masterReplId = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb"
-var masterReplOffset = 0
-var masterReplOffsetMu sync.Mutex
-var replicaConnections []*replicaConn
-var replicaMu sync.Mutex
-var replicaOffset = 0
-var replicaOffsetMu sync.Mutex
-var lastWriteOffset int
-var lastWriteOffsetMu sync.Mutex
+func (s *Storage) set(key, value string, expireAt int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var expiry time.Time
+	if expireAt != NotExpired {
+		expiry = time.UnixMilli(int64(expireAt))
+	}
+	s.data[key] = entry{value: value, expireAt: expiry}
+}
+
+func (s *Storage) getKeys() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	keys := make([]string, 0, len(s.data))
+	for k := range s.data {
+		if e, exists := s.data[k]; exists && (e.expireAt.IsZero() || !time.Now().After(e.expireAt)) {
+			keys = append(keys, k)
+		}
+	}
+	return keys
+}
+
+type ServerConfig struct {
+	dir        string
+	dbfilename string
+}
+
+type ServerInfo struct {
+	role             string
+	masterReplId     string
+	masterReplOffset int
+}
+
+type Server struct {
+	storage         *Storage
+	config          *ServerConfig
+	replicasConn    []net.Conn
+	replicaMu       sync.Mutex
+	masterReplId    string
+	masterReplOffset int
+	masterOffsetMu   sync.Mutex
+	isMasterFlag     bool
+}
+
+func (s *Server) isMaster() bool {
+	return s.isMasterFlag
+}
+
+func (s *Server) getInfo() ServerInfo {
+	s.masterOffsetMu.Lock()
+	defer s.masterOffsetMu.Unlock()
+	return ServerInfo{
+		role:             map[bool]string{true: "master", false: "slave"}[s.isMasterFlag],
+		masterReplId:     s.masterReplId,
+		masterReplOffset: s.masterReplOffset,
+	}
+}
+
+const NotExpired = -1
+
+type CommandHandler interface {
+	handle(s *Server, clientConn net.Conn, commandArgs []string)
+}
+
+type EchoCommandHandler struct{}
+type PingCommandHandler struct{}
+type GetCommandHandler struct{}
+type SetCommandHandler struct{}
+type ConfigCommandHandler struct{}
+type KeysCommandHandler struct{}
+type InfoCommandHandler struct{}
+type ReplconfCommandHandler struct{}
+type PsyncCommandHandler struct{}
+type WaitCommandHandler struct{}
+
+type Command string
+
+const (
+	EchoCommand     Command = "ECHO"
+	PingCommand     Command = "PING"
+	GetCommand      Command = "GET"
+	SetCommand      Command = "SET"
+	ConfigCommand   Command = "CONFIG"
+	KeysCommand     Command = "KEYS"
+	InfoCommand     Command = "INFO"
+	ReplconfCommand Command = "REPLCONF"
+	PsyncCommand    Command = "PSYNC"
+	WaitCommand     Command = "WAIT"
+)
+
+var WriteCommands = []Command{SetCommand}
+
+func (c EchoCommandHandler) handle(s *Server, clientConn net.Conn, commandArgs []string) {
+	fmt.Println("ECHO command was received")
+	clientConn.Write(toBulkString(commandArgs[0]))
+}
+
+func (c PingCommandHandler) handle(s *Server, clientConn net.Conn, commandArgs []string) {
+	fmt.Println("PING command was received")
+	if s.isMaster() {
+		clientConn.Write(toSimpleString("PONG"))
+	}
+}
+
+func (c GetCommandHandler) handle(s *Server, clientConn net.Conn, commandArgs []string) {
+	fmt.Println("GET command was received")
+	fmt.Println("Storage state: ", s.storage.data)
+	val, exists := s.storage.get(commandArgs[0])
+	if !exists {
+		clientConn.Write([]byte("$-1\r\n"))
+	} else {
+		clientConn.Write(toBulkString(val))
+	}
+}
+
+func (c SetCommandHandler) handle(s *Server, clientConn net.Conn, commandArgs []string) {
+	fmt.Println("SET command was received")
+	expiredAt := NotExpired
+	if len(commandArgs) > 2 && strings.ToUpper(commandArgs[2]) == "PX" {
+		i, _ := strconv.Atoi(commandArgs[3])
+		expiredAt = int(time.Now().UnixMilli()) + i
+	}
+	s.storage.set(commandArgs[0], commandArgs[1], expiredAt)
+
+	if s.isMaster() {
+		clientConn.Write(toSimpleString("OK"))
+		s.propagateToReplicas(commandArgs)
+	}
+}
+
+func (c ConfigCommandHandler) handle(s *Server, clientConn net.Conn, commandArgs []string) {
+	fmt.Println("CONFIG command was received")
+	switch commandArgs[1] {
+	case "dir":
+		clientConn.Write(toBulkArray([]string{"dir", s.config.dir}))
+	case "dbfilename":
+		clientConn.Write(toBulkArray([]string{"dbfilename", s.config.dbfilename}))
+	default:
+		fmt.Printf("UNKNOWN CONFIG PARAMETER: %s\n", commandArgs[1])
+	}
+}
+
+func (c KeysCommandHandler) handle(s *Server, clientConn net.Conn, commandArgs []string) {
+	fmt.Println("KEYS command was received")
+	keys := s.storage.getKeys()
+	clientConn.Write(toBulkArray(keys))
+}
+
+func (c InfoCommandHandler) handle(s *Server, clientConn net.Conn, commandArgs []string) {
+	fmt.Println("INFO command was received")
+	serverInfo := s.getInfo()
+	clientConn.Write(toBulkString(fmt.Sprintf("role:%s\r\nmaster_replid:%s\r\nmaster_repl_offset:%d", serverInfo.role, serverInfo.masterReplId, serverInfo.masterReplOffset)))
+}
+
+func (c ReplconfCommandHandler) handle(s *Server, clientConn net.Conn, commandArgs []string) {
+	fmt.Println("REPLCONF command was received")
+	if commandArgs[0] == "listening-port" {
+		s.replicaMu.Lock()
+		s.replicasConn = append(s.replicasConn, clientConn)
+		s.replicaMu.Unlock()
+		fmt.Println("Replica was added")
+		clientConn.Write(toSimpleString("OK"))
+	} else if commandArgs[0] == "capa" && commandArgs[1] == "psync2" {
+		clientConn.Write(toSimpleString("OK"))
+	} else if commandArgs[0] == "GETACK" {
+		// Send replica's offset if slave, or master's offset if master
+		offset := s.getInfo().masterReplOffset
+		if !s.isMaster() {
+			offset = s.replicaOffset // Assuming replicaOffset is tracked
+		}
+		clientConn.Write(toBulkArray([]string{"REPLCONF", "ACK", strconv.Itoa(offset)}))
+		fmt.Printf("Sent REPLCONF ACK with offset: %d\n", offset)
+	} else if commandArgs[0] == "ACK" {
+		if s.isMaster() {
+			offset, err := strconv.Atoi(commandArgs[1])
+			if err == nil {
+				s.replicaMu.Lock()
+				for _, conn := range s.replicasConn {
+					if conn == clientConn {
+						select {
+						case s.ackChan <- offset:
+							fmt.Printf("Master received ACK from replica with offset: %d\n", offset)
+						default:
+							fmt.Println("ACK channel full, dropping ACK")
+						}
+						break
+					}
+				}
+				s.replicaMu.Unlock()
+			}
+		}
+	} else {
+		clientConn.Write(toSimpleString("OK"))
+	}
+}
+
+func (c PsyncCommandHandler) handle(s *Server, clientConn net.Conn, commandArgs []string) {
+	fmt.Println("PSYNC command was received")
+	clientConn.Write(toSimpleString(fmt.Sprintf("FULLRESYNC %s %d", s.getInfo().masterReplId, s.getInfo().masterReplOffset)))
+
+	rdb := "UkVESVMwMDEx+glyZWRpcy12ZXIFNy4yLjD6CnJlZGlzLWJpdHPAQPoFY3RpbWXCbQi8ZfoIdXNlZC1tZW3CsMQQAPoIYW9mLWJhc2XAAP/wbjv+wP9aog=="
+	dst := make([]byte, base64.StdEncoding.DecodedLen(len(rdb)))
+	_, err := base64.StdEncoding.Decode(dst, []byte(rdb))
+	if err != nil {
+		fmt.Printf("Failed to decode RDB: %v\n", err)
+		return
+	}
+	clientConn.Write(toFileString(dst))
+}
+
+func (c WaitCommandHandler) handle(s *Server, clientConn net.Conn, commandArgs []string) {
+	fmt.Println("WAIT command was received")
+	requiredReplicaCount, _ := strconv.Atoi(commandArgs[0])
+	timeout, _ := strconv.Atoi(commandArgs[1])
+
+	s.replicaMu.Lock()
+	if len(s.replicasConn) == 0 {
+		s.replicaMu.Unlock()
+		clientConn.Write([]byte(":0\r\n"))
+		return
+	}
+
+	currentOffset := s.getInfo().masterReplOffset
+	getackCmd := toBulkArray([]string{"REPLCONF", "GETACK", "*"})
+	activeReplicas := make([]net.Conn, 0, len(s.replicasConn))
+
+	for _, replicaConn := range s.replicasConn {
+		err := replicaConn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+		if err != nil {
+			fmt.Printf("Failed to set write deadline for replica: %v\n", err)
+			continue
+		}
+		_, err = replicaConn.Write(getackCmd)
+		if err == nil {
+			activeReplicas = append(activeReplicas, replicaConn)
+		} else {
+			fmt.Printf("Failed to send GETACK to replica: %v\n", err)
+		}
+		_ = replicaConn.SetWriteDeadline(time.Time{})
+	}
+	s.replicasConn = activeReplicas
+	s.replicaMu.Unlock()
+
+	fmt.Printf("Active replicas: %d, required: %d, master offset: %d\n", len(activeReplicas), requiredReplicaCount, currentOffset)
+
+	if len(activeReplicas) == 0 {
+		clientConn.Write([]byte(":0\r\n"))
+		return
+	}
+
+	timeoutChan := time.After(time.Duration(timeout) * time.Millisecond)
+	ackCount := 0
+	ackChan := make(chan int, len(activeReplicas))
+
+	go func() {
+		for {
+			reader := bufio.NewReader(clientConn)
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				fmt.Printf("Error reading ACK from client: %v\n", err)
+				return
+			}
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "*") {
+				numArgs, _ := strconv.Atoi(line[1:])
+				parts := make([]string, 0, numArgs)
+				for i := 0; i < numArgs; i++ {
+					_, _ = reader.ReadString('\n') // Skip length
+					arg, err := reader.ReadString('\n')
+					if err != nil {
+						fmt.Printf("Error reading ACK arg: %v\n", err)
+						return
+					}
+					parts = append(parts, strings.TrimSpace(arg))
+				}
+				if len(parts) >= 3 && parts[0] == "REPLCONF" && parts[1] == "ACK" {
+					offset, err := strconv.Atoi(parts[2])
+					if err == nil && offset >= currentOffset {
+						select {
+						case ackChan <- offset:
+							fmt.Printf("Received valid ACK with offset: %d\n", offset)
+						default:
+							fmt.Println("ACK channel full, dropping ACK")
+						}
+					}
+				}
+			}
+		}
+	}()
+
+	for ackCount < requiredReplicaCount && ackCount < len(activeReplicas) {
+		select {
+		case offset := <-ackChan:
+			if offset >= currentOffset {
+				ackCount++
+				fmt.Printf("Received ack: %d/%d\n", ackCount, requiredReplicaCount)
+			}
+		case <-timeoutChan:
+			fmt.Printf("Timeout reached, final ack count: %d\n", ackCount)
+			break
+		}
+	}
+
+	clientConn.Write([]byte(fmt.Sprintf(":%d\r\n", ackCount)))
+}
+
+func getCommandHandler(command Command) CommandHandler {
+	switch command {
+	case PingCommand:
+		return PingCommandHandler{}
+	case EchoCommand:
+		return EchoCommandHandler{}
+	case GetCommand:
+		return GetCommandHandler{}
+	case SetCommand:
+		return SetCommandHandler{}
+	case KeysCommand:
+		return KeysCommandHandler{}
+	case ConfigCommand:
+		return ConfigCommandHandler{}
+	case InfoCommand:
+		return InfoCommandHandler{}
+	case ReplconfCommand:
+		return ReplconfCommandHandler{}
+	case PsyncCommand:
+		return PsyncCommandHandler{}
+	case WaitCommand:
+		return WaitCommandHandler{}
+	default:
+		panic(fmt.Sprintf("No command handler was found for command: %s", command))
+	}
+}
+
+func (s *Server) propagateToReplicas(parts []string) {
+	s.replicaMu.Lock()
+	defer s.replicaMu.Unlock()
+
+	var builder strings.Builder
+	builder.WriteString(fmt.Sprintf("*%d\r\n", len(parts)))
+	for _, part := range parts {
+		builder.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(part), part))
+	}
+	data := []byte(builder.String())
+
+	s.masterOffsetMu.Lock()
+	s.masterReplOffset += len(data)
+	fmt.Printf("Propagating command: %v, new offset: %d\n", parts, s.masterReplOffset)
+	s.masterOffsetMu.Unlock()
+
+	activeReplicas := make([]net.Conn, 0, len(s.replicasConn))
+	for _, replica := range s.replicasConn {
+		err := replica.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+		if err != nil {
+			fmt.Printf("Failed to set write deadline for replica: %v\n", err)
+			continue
+		}
+		_, err = replica.Write(data)
+		if err == nil {
+			activeReplicas = append(activeReplicas, replica)
+		} else {
+			fmt.Printf("Failed to propagate to replica: %v\n", err)
+		}
+		_ = replica.SetWriteDeadline(time.Time{})
+	}
+	s.replicasConn = activeReplicas
+	fmt.Printf("Propagated to %d replicas\n", len(activeReplicas))
+}
+
+func toSimpleString(s string) []byte {
+	return []byte(fmt.Sprintf("+%s\r\n", s))
+}
+
+func toBulkString(s string) []byte {
+	return []byte(fmt.Sprintf("$%d\r\n%s\r\n", len(s), s))
+}
+
+func toBulkArray(args []string) []byte {
+	var builder strings.Builder
+	builder.WriteString(fmt.Sprintf("*%d\r\n", len(args)))
+	for _, arg := range args {
+		builder.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(arg), arg))
+	}
+	return []byte(builder.String())
+}
+
+func toFileString(data []byte) []byte {
+	return []byte(fmt.Sprintf("$%d\r\n%s", len(data), data))
+}
 
 func main() {
 	dirFlag := flag.String("dir", ".", "Directory for RDB file")
@@ -51,19 +431,25 @@ func main() {
 
 	flag.Parse()
 
-	configDir = *dirFlag
-	configFilename = *fileFlag
-	isReplica = *replicaFlag != ""
+	server := &Server{
+		storage:         &Storage{data: make(map[string]entry)},
+		config:          &ServerConfig{dir: *dirFlag, dbfilename: *fileFlag},
+		masterReplId:    "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb",
+		masterReplOffset: 0,
+		isMasterFlag:     *replicaFlag == "",
+		ackChan:          make(chan int, 100), // Buffer to avoid blocking
+		replicaOffset:    0,
+	}
 
-	rdbPath := configDir + "/" + configFilename
-	loadRDB(rdbPath)
+	rdbPath := *dirFlag + "/" + *fileFlag
+	loadRDB(rdbPath, server.storage)
 
-	if isReplica {
+	if !server.isMasterFlag {
 		parts := strings.Fields(*replicaFlag)
 		if len(parts) == 2 {
 			masterHost := parts[0]
 			masterPort := parts[1]
-			go startReplica(fmt.Sprintf("%s:%s", masterHost, masterPort), *portFlag)
+			go startReplica(fmt.Sprintf("%s:%s", masterHost, masterPort), *portFlag, server)
 		} else {
 			fmt.Println("Invalid replicaof format. Use: host port")
 		}
@@ -82,25 +468,18 @@ func main() {
 			fmt.Println("Connection error:", err)
 			continue
 		}
-		go handleConnection(conn)
+		go handleConnection(conn, server)
 	}
 }
 
-// Helper function to safely write to replica with timeout
-func writeToReplicaWithTimeout(conn net.Conn, data []byte, timeout time.Duration) error {
-	conn.SetWriteDeadline(time.Now().Add(timeout))
-	defer conn.SetWriteDeadline(time.Time{}) // Clear deadline
-	_, err := conn.Write(data)
-	return err
-}
-
-func startReplica(masterAddr string, replicaPort int) {
+func startReplica(masterAddr string, replicaPort int, server *Server) {
 	conn, err := net.Dial("tcp", masterAddr)
 	if err != nil {
 		fmt.Println("Replica dial error:", err)
 		return
 	}
-	
+	defer conn.Close()
+
 	r := bufio.NewReader(conn)
 
 	// Send PING
@@ -120,20 +499,18 @@ func startReplica(masterAddr string, replicaPort int) {
 
 	// Send PSYNC
 	conn.Write([]byte("*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n"))
-	
+
 	// Read FULLRESYNC response
 	fullresyncResp, _ := r.ReadString('\n')
 	fmt.Printf("Replica received FULLRESYNC: %s", fullresyncResp)
-	
+
 	// Read RDB file
 	rdbHeader, _ := r.ReadString('\n')
 	fmt.Printf("Replica received RDB header: %s", rdbHeader)
-	
-	// Parse RDB length from header like "$88\r\n"
+
 	rdbLenStr := strings.TrimSpace(rdbHeader[1:])
 	rdbLen, _ := strconv.Atoi(rdbLenStr)
-	
-	// Read the RDB content
+
 	rdbData := make([]byte, rdbLen)
 	_, err = r.Read(rdbData)
 	if err != nil {
@@ -142,67 +519,52 @@ func startReplica(masterAddr string, replicaPort int) {
 	}
 	fmt.Printf("Replica received RDB data of length: %d\n", len(rdbData))
 
-	// Now listen for propagated commands
 	for {
 		line, err := r.ReadString('\n')
 		if err != nil {
 			fmt.Println("Replica connection closed:", err)
 			break
 		}
-		
-		originalLine := line // Keep original for byte counting
+
+		originalLine := line
 		line = strings.TrimSpace(line)
-		
+
 		if strings.HasPrefix(line, "*") {
 			numArgs, _ := strconv.Atoi(line[1:])
 			parts := make([]string, 0, numArgs)
-			
-			// Start with the command line bytes
 			commandBytes := len(originalLine)
 
 			for i := 0; i < numArgs; i++ {
 				lengthLine, err := r.ReadString('\n')
 				if err != nil {
-					fmt.Printf("Replica error reading length line %d: %v\n", i, err)
 					return
 				}
 				commandBytes += len(lengthLine)
-				
 				arg, err := r.ReadString('\n')
 				if err != nil {
-					fmt.Printf("Replica error reading arg %d: %v\n", i, err)
 					return
 				}
 				commandBytes += len(arg)
 				parts = append(parts, strings.TrimSpace(arg))
 			}
 
-			fmt.Printf("Replica parsed command: %v (total bytes: %d)\n", parts, commandBytes)
+			fmt.Printf("Replica received propagated command: %v (bytes: %d)\n", parts, commandBytes)
 
 			if len(parts) > 0 {
 				cmd := strings.ToUpper(parts[0])
-				
-				// Handle REPLCONF GETACK - DON'T update offset for this command
-				if cmd == "REPLCONF" && len(parts) >= 2 && strings.ToUpper(parts[1]) == "GETACK" {
-					fmt.Printf("Replica handling GETACK command\n")
-					replicaOffsetMu.Lock()
-					currentOffset := replicaOffset
-					replicaOffsetMu.Unlock()
-
-					offsetStr := strconv.Itoa(currentOffset)
-					response := fmt.Sprintf("*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$%d\r\n%s\r\n", len(offsetStr), offsetStr)
-					fmt.Printf("Replica sending ACK response: %q\n", response)
-					_, err := conn.Write([]byte(response))
+				if cmd == "REPLCONF" && len(parts) >= 3 && strings.ToUpper(parts[1]) == "GETACK" {
+					server.replicaMu.Lock()
+					currentOffset := server.replicaOffset
+					server.replicaMu.Unlock()
+					response := toBulkArray([]string{"REPLCONF", "ACK", strconv.Itoa(currentOffset)})
+					_, err := conn.Write(response)
 					if err != nil {
-						fmt.Printf("Replica failed to send REPLCONF ACK: %v\n", err)
-						return // Exit if connection is broken
+						fmt.Printf("Failed to send REPLCONF ACK: %v\n", err)
 					} else {
 						fmt.Printf("Replica sent ACK response with offset: %d\n", currentOffset)
 					}
-					// Don't update offset for GETACK commands
 					continue
 				} else {
-					// For all other commands, process them and then update offset
 					switch cmd {
 					case "SET":
 						if len(parts) >= 3 {
@@ -215,43 +577,37 @@ func startReplica(masterAddr string, replicaPort int) {
 									expireAt = time.Now().Add(time.Duration(ms) * time.Millisecond)
 								}
 							}
-							mu.Lock()
-							store[key] = entry{value: val, expireAt: expireAt}
-							mu.Unlock()
+							server.storage.set(key, val, NotExpired)
+							if !expireAt.IsZero() {
+								server.storage.set(key, val, int(expireAt.UnixMilli()))
+							}
 							fmt.Printf("Replica stored: %s = %s\n", key, val)
 						}
 					case "PING":
 						fmt.Printf("Replica processed PING\n")
-					default:
-						fmt.Printf("Replica received unknown command: %s\n", cmd)
 					}
-					
-					// Update offset after processing write commands
-					replicaOffsetMu.Lock()
-					replicaOffset += commandBytes
-					replicaOffsetMu.Unlock()
-					fmt.Printf("Replica offset updated to: %d\n", replicaOffset)
+					server.replicaMu.Lock()
+					server.replicaOffset += commandBytes
+					server.replicaMu.Unlock()
+					fmt.Printf("Replica offset updated to: %d\n", server.replicaOffset)
 				}
 			}
 		}
 	}
-	
-	conn.Close()
 }
 
-func handleConnection(conn net.Conn) {
+func handleConnection(conn net.Conn, server *Server) {
 	defer func() {
 		conn.Close()
-		// Remove this connection from replica list if it was a replica
-		replicaMu.Lock()
-		newConnections := make([]*replicaConn, 0, len(replicaConnections))
-		for _, replica := range replicaConnections {
-			if replica.conn != conn {
+		server.replicaMu.Lock()
+		newConnections := make([]net.Conn, 0, len(server.replicasConn))
+		for _, replica := range server.replicasConn {
+			if replica != conn {
 				newConnections = append(newConnections, replica)
 			}
 		}
-		replicaConnections = newConnections
-		replicaMu.Unlock()
+		server.replicasConn = newConnections
+		server.replicaMu.Unlock()
 	}()
 
 	reader := bufio.NewReader(conn)
@@ -266,9 +622,8 @@ func handleConnection(conn net.Conn) {
 		if strings.HasPrefix(line, "*") {
 			numArgs, _ := strconv.Atoi(line[1:])
 			parts := make([]string, 0, numArgs)
-
 			for i := 0; i < numArgs; i++ {
-				_, err := reader.ReadString('\n') // skip $<len>
+				_, err := reader.ReadString('\n')
 				if err != nil {
 					return
 				}
@@ -284,267 +639,13 @@ func handleConnection(conn net.Conn) {
 			}
 
 			cmd := strings.ToUpper(parts[0])
-
-			switch cmd {
-			case "PING":
-				conn.Write([]byte("+PONG\r\n"))
-
-			case "ECHO":
-				if len(parts) == 2 {
-					msg := parts[1]
-					resp := fmt.Sprintf("$%d\r\n%s\r\n", len(msg), msg)
-					conn.Write([]byte(resp))
-				}
-
-			case "SET":
-				if len(parts) < 3 {
-					conn.Write([]byte("-ERR wrong number of arguments for 'set'\r\n"))
-					continue
-				}
-				key := parts[1]
-				val := parts[2]
-				var expireAt time.Time
-				if len(parts) == 5 && strings.ToUpper(parts[3]) == "PX" {
-					ms, err := strconv.Atoi(parts[4])
-					if err == nil {
-						expireAt = time.Now().Add(time.Duration(ms) * time.Millisecond)
-					}
-				}
-				mu.Lock()
-				store[key] = entry{value: val, expireAt: expireAt}
-				mu.Unlock()
-				conn.Write([]byte("+OK\r\n"))
-
-				// Track last write and propagate if master
-				if !isReplica {
-					// Record the offset before propagation
-					masterReplOffsetMu.Lock()
-					lastWriteOffsetMu.Lock()
-					lastWriteOffset = masterReplOffset
-					lastWriteOffsetMu.Unlock()
-					masterReplOffsetMu.Unlock()
-					
-					propagateToReplicas(parts)
-				}
-
-			case "GET":
-				if len(parts) < 2 {
-					conn.Write([]byte("-ERR wrong number of arguments for 'get'\r\n"))
-					continue
-				}
-				key := parts[1]
-				mu.RLock()
-				e, exists := store[key]
-				mu.RUnlock()
-				if !exists || (!e.expireAt.IsZero() && time.Now().After(e.expireAt)) {
-					mu.Lock()
-					delete(store, key)
-					mu.Unlock()
-					conn.Write([]byte("$-1\r\n"))
-				} else {
-					resp := fmt.Sprintf("$%d\r\n%s\r\n", len(e.value), e.value)
-					conn.Write([]byte(resp))
-				}
-
-			case "CONFIG":
-				if len(parts) == 3 && strings.ToUpper(parts[1]) == "GET" {
-					param := strings.ToLower(parts[2])
-					var value string
-					if param == "dir" {
-						value = configDir
-					} else if param == "dbfilename" {
-						value = configFilename
-					} else {
-						conn.Write([]byte("*0\r\n"))
-						continue
-					}
-					resp := fmt.Sprintf("*2\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
-						len(param), param, len(value), value)
-					conn.Write([]byte(resp))
-				} else {
-					conn.Write([]byte("-ERR unknown CONFIG command\r\n"))
-				}
-
-			case "KEYS":
-				if len(parts) == 2 && parts[1] == "*" {
-					mu.RLock()
-					var resp strings.Builder
-					resp.WriteString(fmt.Sprintf("*%d\r\n", len(store)))
-					for k := range store {
-						resp.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(k), k))
-					}
-					mu.RUnlock()
-					conn.Write([]byte(resp.String()))
-				} else {
-					conn.Write([]byte("*0\r\n"))
-				}
-
-			case "INFO":
-				if len(parts) == 2 && strings.ToLower(parts[1]) == "replication" {
-					var info strings.Builder
-					role := "master"
-					if isReplica {
-						role = "slave"
-					}
-					info.WriteString(fmt.Sprintf("role:%s\r\n", role))
-					if !isReplica {
-						masterReplOffsetMu.Lock()
-						info.WriteString(fmt.Sprintf("master_replid:%s\r\n", masterReplId))
-						info.WriteString(fmt.Sprintf("master_repl_offset:%d\r\n", masterReplOffset))
-						masterReplOffsetMu.Unlock()
-					}
-					resp := fmt.Sprintf("$%d\r\n%s\r\n", info.Len(), info.String())
-					conn.Write([]byte(resp))
-				}
-
-			case "WAIT":
-				if len(parts) >= 3 {
-					numReplicas, _ := strconv.Atoi(parts[1])
-					timeoutMs, _ := strconv.Atoi(parts[2])
-
-					ackCount := waitForReplicas(numReplicas, timeoutMs)
-					conn.Write([]byte(fmt.Sprintf(":%d\r\n", ackCount)))
-
-				} else {
-					conn.Write([]byte("-ERR wrong number of arguments for 'wait' command\r\n"))
-				}
-
-			case "REPLCONF":
-				if len(parts) >= 3 && strings.ToUpper(parts[1]) == "ACK" {
-					offset, err := strconv.Atoi(parts[2])
-					if err == nil {
-						replicaMu.Lock()
-						for _, replica := range replicaConnections {
-							if replica.conn == conn {
-								select {
-								case replica.ackChan <- offset:
-									fmt.Printf("Master received ACK from replica with offset: %d\n", offset)
-								default:
-									fmt.Printf("Master ACK channel full, dropping ACK\n")
-								}
-								break
-							}
-						}
-						replicaMu.Unlock()
-					}
-					// Don't send +OK for ACK responses
-				} else {
-					conn.Write([]byte("+OK\r\n"))
-				}
-
-			case "PSYNC":
-				if len(parts) == 3 && parts[1] == "?" && parts[2] == "-1" {
-					masterReplOffsetMu.Lock()
-					fullResync := fmt.Sprintf("+FULLRESYNC %s %d\r\n", masterReplId, masterReplOffset)
-					masterReplOffsetMu.Unlock()
-					conn.Write([]byte(fullResync))
-
-					emptyRDB := []byte{
-						0x52, 0x45, 0x44, 0x49, 0x53, 0x30, 0x30, 0x30, 0x37,
-						0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-					}
-					conn.Write([]byte(fmt.Sprintf("$%d\r\n", len(emptyRDB))))
-					conn.Write(emptyRDB)
-
-					replicaMu.Lock()
-					replica := &replicaConn{
-						conn:      conn,
-						offset:    0,
-						ackChan:   make(chan int, 1),
-						isReplica: true,
-					}
-					replicaConnections = append(replicaConnections, replica)
-					replicaMu.Unlock()
-				} else {
-					conn.Write([]byte("-ERR unsupported PSYNC format\r\n"))
-				}
-
-			default:
-				conn.Write([]byte("-ERR unknown command\r\n"))
-			}
+			handler := getCommandHandler(Command(cmd))
+			handler.handle(server, conn, parts[1:])
 		}
 	}
 }
 
-func waitForReplicas(numReplicas int, timeoutMs int) int {
-    replicaMu.Lock()
-    if len(replicaConnections) == 0 {
-        replicaMu.Unlock()
-        return 0
-    }
-
-    // Get the current master offset
-    masterReplOffsetMu.Lock()
-    expectedOffset := masterReplOffset
-    masterReplOffsetMu.Unlock()
-
-    // Send GETACK to all replicas
-    getackCmd := "*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n"
-    activeReplicas := make([]*replicaConn, 0, len(replicaConnections))
-
-    // Filter out dead connections while sending GETACK
-    for _, replica := range replicaConnections {
-        err := writeToReplicaWithTimeout(replica.conn, []byte(getackCmd), 100*time.Millisecond)
-        if err == nil {
-            activeReplicas = append(activeReplicas, replica)
-        } else {
-            fmt.Printf("Failed to send GETACK to replica: %v\n", err)
-        }
-    }
-    replicaConnections = activeReplicas
-    replicaMu.Unlock()
-
-    fmt.Printf("Active replicas: %d, required: %d\n", len(activeReplicas), numReplicas)
-
-    if len(activeReplicas) == 0 {
-        return 0
-    }
-
-    // Create timeout context
-    ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
-    defer cancel()
-
-    ackCount := 0
-    responseChan := make(chan int, len(activeReplicas))
-
-    // Collect responses from all replicas
-    for _, replica := range activeReplicas {
-        go func(r *replicaConn) {
-            select {
-            case offset := <-r.ackChan:
-                fmt.Printf("Received ACK from replica with offset: %d, expected: %d\n", offset, expectedOffset)
-				if offset >= expectedOffset {
-					responseChan <- 1
-				} else {
-					responseChan <- 0
-				}
-            case <-ctx.Done():
-                fmt.Printf("Timeout waiting for ACK from replica\n")
-                responseChan <- 0
-            }
-        }(replica)
-    }
-
-    // Wait for responses until we have enough or timeout
-    for i := 0; i < len(activeReplicas); i++ {
-        select {
-        case ack := <-responseChan:
-            ackCount += ack
-            fmt.Printf("Current ack count: %d\n", ackCount)
-            if ackCount >= numReplicas {
-                return ackCount
-            }
-        case <-ctx.Done():
-            fmt.Printf("Timeout reached, final ack count: %d\n", ackCount)
-            return ackCount
-        }
-    }
-
-    return ackCount
-}
-
-// Load RDB file with proper expiry handling
-func loadRDB(path string) {
+func loadRDB(path string, storage *Storage) {
 	file, err := os.Open(path)
 	if err != nil {
 		return
@@ -552,8 +653,6 @@ func loadRDB(path string) {
 	defer file.Close()
 
 	reader := bufio.NewReader(file)
-
-	// Read and verify header
 	header := make([]byte, 9)
 	_, err = reader.Read(header)
 	if err != nil || string(header[:5]) != "REDIS" {
@@ -567,37 +666,33 @@ func loadRDB(path string) {
 		}
 
 		switch opcode {
-		case 0xFF: // EOF
+		case 0xFF:
 			return
-		case 0xFE: // Database selector
-			_, _ = readLength(reader) // Skip database number
-		case 0xFB: // Resizedb
-			_, _ = readLength(reader) // Skip hash table size
-			_, _ = readLength(reader) // Skip expire hash table size
-		case 0xFA: // Auxiliary field
-			_, _ = readString(reader) // Skip key
-			_, _ = readString(reader) // Skip value
-		case 0xFD: // Expiry in seconds
+		case 0xFE:
+			_, _ = readLength(reader)
+		case 0xFB:
+			_, _ = readLength(reader)
+			_, _ = readLength(reader)
+		case 0xFA:
+			_, _ = readString(reader)
+			_, _ = readString(reader)
+		case 0xFD:
 			expiry := make([]byte, 4)
 			_, err = reader.Read(expiry)
 			if err != nil {
 				return
 			}
 			expiryTime := time.Unix(int64(binary.LittleEndian.Uint32(expiry)), 0)
-			
 			valueType, err := reader.ReadByte()
 			if err != nil {
 				return
 			}
-			
-			if valueType == 0x00 { // String type
+			if valueType == 0x00 {
 				key, _ := readString(reader)
 				val, _ := readString(reader)
-				mu.Lock()
-				store[key] = entry{value: val, expireAt: expiryTime}
-				mu.Unlock()
+				storage.set(key, val, int(expiryTime.UnixMilli()))
 			}
-		case 0xFC: // Expiry in milliseconds
+		case 0xFC:
 			expiry := make([]byte, 8)
 			_, err = reader.Read(expiry)
 			if err != nil {
@@ -605,33 +700,25 @@ func loadRDB(path string) {
 			}
 			expiryMs := int64(binary.LittleEndian.Uint64(expiry))
 			expiryTime := time.Unix(expiryMs/1000, (expiryMs%1000)*1000000)
-			
 			valueType, err := reader.ReadByte()
 			if err != nil {
 				return
 			}
-			
-			if valueType == 0x00 { // String type
+			if valueType == 0x00 {
 				key, _ := readString(reader)
 				val, _ := readString(reader)
-				mu.Lock()
-				store[key] = entry{value: val, expireAt: expiryTime}
-				mu.Unlock()
+				storage.set(key, val, int(expiryTime.UnixMilli()))
 			}
-		case 0x00: // String type without expiry
+		case 0x00:
 			key, _ := readString(reader)
 			val, _ := readString(reader)
-			mu.Lock()
-			store[key] = entry{value: val}
-			mu.Unlock()
+			storage.set(key, val, NotExpired)
 		default:
-			// Skip unknown opcodes or other value types
 			continue
 		}
 	}
 }
 
-// Read length-encoded integer
 func readLength(r *bufio.Reader) (int, error) {
 	b, err := r.ReadByte()
 	if err != nil {
@@ -658,7 +745,6 @@ func readLength(r *bufio.Reader) (int, error) {
 	}
 }
 
-// Read string from RDB
 func readString(r *bufio.Reader) (string, error) {
 	length, err := readLength(r)
 	if err != nil {
@@ -667,31 +753,4 @@ func readString(r *bufio.Reader) (string, error) {
 	buf := make([]byte, length)
 	_, err = r.Read(buf)
 	return string(buf), err
-}
-
-func propagateToReplicas(parts []string) {
-	replicaMu.Lock()
-	defer replicaMu.Unlock()
-
-	var builder strings.Builder
-	builder.WriteString(fmt.Sprintf("*%d\r\n", len(parts)))
-	for _, part := range parts {
-		builder.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(part), part))
-	}
-	data := []byte(builder.String())
-
-	// Update master offset first
-	masterReplOffsetMu.Lock()
-	masterReplOffset += len(data)
-	masterReplOffsetMu.Unlock()
-
-	// Send to replicas with timeout, filter out dead connections
-	activeReplicas := make([]*replicaConn, 0, len(replicaConnections))
-	for _, replica := range replicaConnections {
-		err := writeToReplicaWithTimeout(replica.conn, data, 100*time.Millisecond)
-		if err == nil {
-			activeReplicas = append(activeReplicas, replica)
-		}
-	}
-	replicaConnections = activeReplicas
 }
