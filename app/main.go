@@ -170,22 +170,27 @@ func startReplica(masterAddr string, replicaPort int) {
 				
 				// Handle REPLCONF GETACK before updating offset
 				if cmd == "REPLCONF" && len(parts) >= 3 && strings.ToUpper(parts[1]) == "GETACK" {
-					// Get current offset BEFORE processing this command
-					replicaOffsetMu.Lock()
-					currentOffset := replicaOffset
-					replicaOffsetMu.Unlock()
-					
-					// Respond with current offset (excluding this GETACK command)
-					offsetStr := strconv.Itoa(currentOffset)
-					response := fmt.Sprintf("*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$%d\r\n%s\r\n", len(offsetStr), offsetStr)
-					conn.Write([]byte(response))
-					fmt.Printf("Replica sent ACK response with offset: %d\n", currentOffset)
-					
-					// Update offset after responding
-					replicaOffsetMu.Lock()
-					replicaOffset += totalCommandBytes
-					replicaOffsetMu.Unlock()
-				} else {
+    // Get current offset BEFORE processing this command
+    replicaOffsetMu.Lock()
+    currentOffset := replicaOffset
+    replicaOffsetMu.Unlock()
+    
+    // Respond with current offset (excluding this GETACK command)
+    offsetStr := strconv.Itoa(currentOffset)
+    response := fmt.Sprintf("*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$%d\r\n%s\r\n", len(offsetStr), offsetStr)
+    _, err := conn.Write([]byte(response))
+    if err != nil {
+        fmt.Printf("Failed to send REPLCONF ACK: %v\n", err)
+    } else {
+        fmt.Printf("Replica sent ACK response with offset: %d\n", currentOffset)
+    }
+    
+    // Update offset after responding
+    replicaOffsetMu.Lock()
+    replicaOffset += totalCommandBytes
+    replicaOffsetMu.Unlock()
+    fmt.Printf("Replica offset updated to: %d after GETACK\n", replicaOffset)
+}else {
 					// For all other commands, process them and then update offset
 					switch cmd {
 					case "SET":
@@ -375,62 +380,60 @@ func handleConnection(conn net.Conn) {
 				}
 
 			case "REPLCONF":
-				if len(parts) >= 2 && strings.ToUpper(parts[1]) == "ACK" && len(parts) >= 3 {
-					// This is an ACK response from a replica
-					offset, err := strconv.Atoi(parts[2])
-					if err == nil {
-						// Find the replica and send the offset to its channel
-						replicaMu.Lock()
-						for _, replica := range replicaConnections {
-							if replica.conn == conn {
-								select {
-								case replica.ackChan <- offset:
-								default:
-								}
-								break
-							}
-						}
-						replicaMu.Unlock()
-					}
-				} else {
-					conn.Write([]byte("+OK\r\n"))
-				}
+    if len(parts) >= 2 && strings.ToUpper(parts[1]) == "ACK" && len(parts) >= 3 {
+        // This is an ACK response from a replica
+        offset, err := strconv.Atoi(parts[2])
+        if err == nil {
+            // Find the replica and send the offset to its channel
+            replicaMu.Lock()
+            for _, replica := range replicaConnections {
+                if replica.conn == conn {
+                    replica.ackChan <- offset // Blocking send
+                    fmt.Printf("Master received ACK from replica with offset: %d\n", offset)
+                    break
+                }
+            }
+            replicaMu.Unlock()
+        }
+    } else {
+        conn.Write([]byte("+OK\r\n"))
+    }
 				
 			case "PSYNC":
-				if len(parts) == 3 && parts[1] == "?" && parts[2] == "-1" {
-					// 1. Send FULLRESYNC line
-					masterReplOffsetMu.Lock()
-					fullResync := fmt.Sprintf("+FULLRESYNC %s %d\r\n", masterReplId, masterReplOffset)
-					masterReplOffsetMu.Unlock()
-					conn.Write([]byte(fullResync))
+    if len(parts) == 3 && parts[1] == "?" && parts[2] == "-1" {
+        // 1. Send FULLRESYNC line
+        masterReplOffsetMu.Lock()
+        fullResync := fmt.Sprintf("+FULLRESYNC %s %d\r\n", masterReplId, masterReplOffset)
+        masterReplOffsetMu.Unlock()
+        conn.Write([]byte(fullResync))
 
-					// 2. Prepare empty RDB file bytes
-					emptyRDB := []byte{
-						0x52, 0x45, 0x44, 0x49, 0x53, 0x30, 0x30, 0x30, 0x37, // "REDIS0007"
-						0xFF, // End of file opcode
-						0x00, 0x00, // Checksum (placeholder, still accepted)
-						0x00, 0x00,
-						0x00, 0x00,
-						0x00, 0x00,
-					}
+        // 2. Prepare empty RDB file bytes
+        emptyRDB := []byte{
+            0x52, 0x45, 0x44, 0x49, 0x53, 0x30, 0x30, 0x30, 0x37, // "REDIS0007"
+            0xFF, // End of file opcode
+            0x00, 0x00, // Checksum (placeholder, still accepted)
+            0x00, 0x00,
+            0x00, 0x00,
+            0x00, 0x00,
+        }
 
-					// 3. Send RESP-like bulk string header (without trailing \r\n in content)
-					rdbLen := len(emptyRDB)
-					conn.Write([]byte(fmt.Sprintf("$%d\r\n", rdbLen)))
-					conn.Write(emptyRDB) // no trailing \r\n after content
-					
-					replicaMu.Lock()
-					replica := &replicaConn{
-						conn:      conn,
-						offset:    0,
-						ackChan:   make(chan int, 1),
-						isReplica: true,
-					}
-					replicaConnections = append(replicaConnections, replica)
-					replicaMu.Unlock()
-				} else {
-					conn.Write([]byte("-ERR unsupported PSYNC format\r\n"))
-				}
+        // 3. Send RESP-like bulk string header (without trailing \r\n in content)
+        rdbLen := len(emptyRDB)
+        conn.Write([]byte(fmt.Sprintf("$%d\r\n", rdbLen)))
+        conn.Write(emptyRDB) // no trailing \r\n after content
+        
+        replicaMu.Lock()
+        replica := &replicaConn{
+            conn:      conn,
+            offset:    0,
+            ackChan:   make(chan int, 1),
+            isReplica: true,
+        }
+        replicaConnections = append(replicaConnections, replica)
+        replicaMu.Unlock()
+    } else {
+        conn.Write([]byte("-ERR unsupported PSYNC format\r\n"))
+    }
 
 			default:
 				conn.Write([]byte("-ERR unknown command\r\n"))
@@ -440,64 +443,79 @@ func handleConnection(conn net.Conn) {
 }
 
 func waitForReplicas(numReplicas int, timeoutMs int) int {
-	if numReplicas == 0 {
-		return 0
-	}
+    if numReplicas == 0 {
+        return 0
+    }
 
-	replicaMu.Lock()
-	if len(replicaConnections) == 0 {
-		replicaMu.Unlock()
-		return 0
-	}
-	
-	// Get current master offset
-	masterReplOffsetMu.Lock()
-	currentOffset := masterReplOffset
-	masterReplOffsetMu.Unlock()
-	
-	// Send GETACK to all replicas
-	getackCmd := "*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n"
-	activeReplicas := make([]*replicaConn, 0, len(replicaConnections))
-	
-	for _, replica := range replicaConnections {
-		_, err := replica.conn.Write([]byte(getackCmd))
-		if err != nil {
-			// Remove disconnected replica
-			continue
-		}
-		activeReplicas = append(activeReplicas, replica)
-	}
-	
-	// Update the list with only active replicas
-	replicaConnections = activeReplicas
-	replicaMu.Unlock()
+    replicaMu.Lock()
+    fmt.Printf("WAIT: %d replicas connected\n", len(replicaConnections))
+    if len(replicaConnections) == 0 {
+        replicaMu.Unlock()
+        return 0
+    }
 
-	if len(activeReplicas) == 0 {
-		return 0
-	}
+    // Send GETACK to all replicas
+    getackCmd := "*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n"
+    getackCmdBytes := len(getackCmd)
+    activeReplicas := make([]*replicaConn, 0, len(replicaConnections))
+    
+    for _, replica := range replicaConnections {
+        _, err := replica.conn.Write([]byte(getackCmd))
+        if err != nil {
+            fmt.Printf("Failed to send GETACK to replica: %v\n", err)
+            continue
+        }
+        activeReplicas = append(activeReplicas, replica)
+    }
+    
+    // Update the list with only active replicas
+    replicaConnections = activeReplicas
+    replicaMu.Unlock()
 
-	// Wait for ACK responses
-	ackCount := 0
-	timeout := time.NewTimer(time.Duration(timeoutMs) * time.Millisecond)
-	defer timeout.Stop()
+    if len(activeReplicas) == 0 {
+        fmt.Println("No active replicas after sending GETACK")
+        return 0
+    }
 
-	// Wait for responses or timeout
-	for i := 0; i < len(activeReplicas); i++ {
-		select {
-		case replicaOffset := <-activeReplicas[i].ackChan:
-			// Check if replica is caught up
-			if replicaOffset >= currentOffset {
-				ackCount++
-				if ackCount >= numReplicas {
-					return ackCount
-				}
-			}
-		case <-timeout.C:
-			return ackCount
-		}
-	}
+    // Update master offset to include GETACK command
+    masterReplOffsetMu.Lock()
+    currentOffset := masterReplOffset
+    masterReplOffset += getackCmdBytes * len(activeReplicas)
+    masterReplOffsetMu.Unlock()
 
-	return ackCount
+    // Wait for ACK responses
+    ackCount := 0
+    timeout := time.NewTimer(time.Duration(timeoutMs) * time.Millisecond)
+    defer timeout.Stop()
+
+    // Use a channel to collect all ACKs
+    done := make(chan struct{})
+    go func() {
+        for _, replica := range activeReplicas {
+            select {
+            case replicaOffset := <-replica.ackChan:
+                fmt.Printf("Received ACK from replica with offset: %d (master offset: %d)\n", replicaOffset, currentOffset)
+                // Allow replica offset to be slightly behind due to GETACK command
+                if replicaOffset >= currentOffset-getackCmdBytes {
+                    ackCount++
+                }
+            case <-timeout.C:
+                fmt.Println("Timeout waiting for replica ACKs")
+                return
+            }
+        }
+        close(done)
+    }()
+
+    select {
+    case <-done:
+        // All replicas responded
+        fmt.Printf("All replicas responded, ackCount: %d\n", ackCount)
+    case <-timeout.C:
+        fmt.Printf("WAIT timeout reached, ackCount: %d\n", ackCount)
+    }
+
+    return ackCount
 }
 
 // Load RDB file with proper expiry handling
