@@ -39,9 +39,6 @@ var replicaConnections []*replicaConn
 var replicaMu sync.Mutex
 var replicaOffset = 0
 var replicaOffsetMu sync.Mutex
-var lastWaitOffset int
-var lastWaitOffsetMu sync.Mutex
-
 
 func main() {
 	dirFlag := flag.String("dir", ".", "Directory for RDB file")
@@ -458,16 +455,6 @@ func waitForReplicas(numReplicas int, timeoutMs int) int {
 	masterReplOffsetMu.Lock()
 	expectedOffset := masterReplOffset
 	masterReplOffsetMu.Unlock()
-
-	lastWaitOffsetMu.Lock()
-	sameOffset := (currentOffset == lastWaitOffset)
-	lastWaitOffset = currentOffset
-	lastWaitOffsetMu.Unlock()
-
-	if sameOffset {
-		fmt.Println("WAIT: No new writes since last WAIT, returning 0 immediately")
-		return 0
-	}
 
 	// Send GETACK to all replicas
 	getackCmd := "*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n"
