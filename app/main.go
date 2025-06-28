@@ -376,14 +376,9 @@ func handleConnection(conn net.Conn) {
 					numReplicas, _ := strconv.Atoi(parts[1])
 					timeoutMs, _ := strconv.Atoi(parts[2])
 
-					if lastWrite { // ✅ Only if a write happened
-						ackCount := waitForReplicas(numReplicas, timeoutMs)
-						resp := fmt.Sprintf(":%d\r\n", ackCount)
-						conn.Write([]byte(resp))
-						lastWrite = false // ✅ Reset after WAIT
-					} else {
-						conn.Write([]byte(":0\r\n")) // ✅ No write, return 0
-					}
+					ackCount := waitForReplicas(numReplicas, timeoutMs)
+conn.Write([]byte(fmt.Sprintf(":%d\r\n", ackCount)))
+
 				} else {
 					conn.Write([]byte("-ERR wrong number of arguments for 'wait' command\r\n"))
 				}
