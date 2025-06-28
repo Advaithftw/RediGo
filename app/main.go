@@ -170,12 +170,8 @@ func startReplica(masterAddr string, replicaPort int) {
 				
 				// Handle REPLCONF GETACK before updating offset
 				if cmd == "REPLCONF" && len(parts) >= 3 && strings.ToUpper(parts[1]) == "GETACK" {
-    // 👎 Wrong order:
-    // - You're sending ACK before updating the replicaOffset
-
-    // ✅ Fix: update replicaOffset *before* sending the ACK
+    // Properly handle GETACK by sending ACK back
     replicaOffsetMu.Lock()
-    replicaOffset += totalCommandBytes
     currentOffset := replicaOffset
     replicaOffsetMu.Unlock()
 
@@ -188,7 +184,6 @@ func startReplica(masterAddr string, replicaPort int) {
         fmt.Printf("Replica sent ACK response with offset: %d\n", currentOffset)
     }
 
-    fmt.Printf("Replica offset updated to: %d after GETACK\n", currentOffset)
     continue
 } else {
 					// For all other commands, process them and then update offset
