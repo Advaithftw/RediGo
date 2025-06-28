@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"flag"
 	"fmt"
@@ -39,6 +40,8 @@ var replicaConnections []*replicaConn
 var replicaMu sync.Mutex
 var replicaOffset = 0
 var replicaOffsetMu sync.Mutex
+var lastWriteOffset int
+var lastWriteOffsetMu sync.Mutex
 
 func main() {
 	dirFlag := flag.String("dir", ".", "Directory for RDB file")
@@ -81,6 +84,14 @@ func main() {
 		}
 		go handleConnection(conn)
 	}
+}
+
+// Helper function to safely write to replica with timeout
+func writeToReplicaWithTimeout(conn net.Conn, data []byte, timeout time.Duration) error {
+	conn.SetWriteDeadline(time.Now().Add(timeout))
+	defer conn.SetWriteDeadline(time.Time{}) // Clear deadline
+	_, err := conn.Write(data)
+	return err
 }
 
 func startReplica(masterAddr string, replicaPort int) {
@@ -152,33 +163,39 @@ func startReplica(masterAddr string, replicaPort int) {
 			for i := 0; i < numArgs; i++ {
 				lengthLine, err := r.ReadString('\n')
 				if err != nil {
+					fmt.Printf("Replica error reading length line %d: %v\n", i, err)
 					return
 				}
 				commandBytes += len(lengthLine)
 				
 				arg, err := r.ReadString('\n')
 				if err != nil {
+					fmt.Printf("Replica error reading arg %d: %v\n", i, err)
 					return
 				}
 				commandBytes += len(arg)
 				parts = append(parts, strings.TrimSpace(arg))
 			}
 
+			fmt.Printf("Replica parsed command: %v (total bytes: %d)\n", parts, commandBytes)
+
 			if len(parts) > 0 {
 				cmd := strings.ToUpper(parts[0])
-				fmt.Printf("Replica received propagated command: %v (bytes: %d)\n", parts, commandBytes)
 				
 				// Handle REPLCONF GETACK - DON'T update offset for this command
-				if cmd == "REPLCONF" && len(parts) >= 3 && strings.ToUpper(parts[1]) == "GETACK" {
+				if cmd == "REPLCONF" && len(parts) >= 2 && strings.ToUpper(parts[1]) == "GETACK" {
+					fmt.Printf("Replica handling GETACK command\n")
 					replicaOffsetMu.Lock()
 					currentOffset := replicaOffset
 					replicaOffsetMu.Unlock()
 
 					offsetStr := strconv.Itoa(currentOffset)
 					response := fmt.Sprintf("*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$%d\r\n%s\r\n", len(offsetStr), offsetStr)
+					fmt.Printf("Replica sending ACK response: %q\n", response)
 					_, err := conn.Write([]byte(response))
 					if err != nil {
-						fmt.Printf("Failed to send REPLCONF ACK: %v\n", err)
+						fmt.Printf("Replica failed to send REPLCONF ACK: %v\n", err)
+						return // Exit if connection is broken
 					} else {
 						fmt.Printf("Replica sent ACK response with offset: %d\n", currentOffset)
 					}
@@ -205,6 +222,8 @@ func startReplica(masterAddr string, replicaPort int) {
 						}
 					case "PING":
 						fmt.Printf("Replica processed PING\n")
+					default:
+						fmt.Printf("Replica received unknown command: %s\n", cmd)
 					}
 					
 					// Update offset after processing write commands
@@ -298,6 +317,13 @@ func handleConnection(conn net.Conn) {
 
 				// Track last write and propagate if master
 				if !isReplica {
+					// Record the offset before propagation
+					masterReplOffsetMu.Lock()
+					lastWriteOffsetMu.Lock()
+					lastWriteOffset = masterReplOffset
+					lastWriteOffsetMu.Unlock()
+					masterReplOffsetMu.Unlock()
+					
 					propagateToReplicas(parts)
 				}
 
@@ -401,6 +427,7 @@ func handleConnection(conn net.Conn) {
 						}
 						replicaMu.Unlock()
 					}
+					// Don't send +OK for ACK responses
 				} else {
 					conn.Write([]byte("+OK\r\n"))
 				}
@@ -450,15 +477,31 @@ func waitForReplicas(numReplicas int, timeoutMs int) int {
 		return 0
 	}
 
+	// Check if there have been any writes since last check
+	lastWriteOffsetMu.Lock()
 	masterReplOffsetMu.Lock()
 	expectedOffset := masterReplOffset
+	hasRecentWrites := lastWriteOffset < masterReplOffset
 	masterReplOffsetMu.Unlock()
+	lastWriteOffsetMu.Unlock()
 
+	// If no recent writes, return current replica count immediately
+	if !hasRecentWrites {
+		replicaCount := len(replicaConnections)
+		replicaMu.Unlock()
+		if replicaCount >= numReplicas {
+			return numReplicas
+		}
+		return replicaCount
+	}
+
+	// Send GETACK only if there are recent writes
 	getackCmd := "*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n"
 	activeReplicas := make([]*replicaConn, 0, len(replicaConnections))
 
+	// Filter out dead connections while sending GETACK
 	for _, replica := range replicaConnections {
-		_, err := replica.conn.Write([]byte(getackCmd))
+		err := writeToReplicaWithTimeout(replica.conn, []byte(getackCmd), 100*time.Millisecond)
 		if err == nil {
 			activeReplicas = append(activeReplicas, replica)
 		}
@@ -470,34 +513,38 @@ func waitForReplicas(numReplicas int, timeoutMs int) int {
 		return 0
 	}
 
-	timeout := time.After(time.Duration(timeoutMs) * time.Millisecond)
-	ackCount := 0
-	received := make(chan int, len(activeReplicas))
+	// Create timeout context
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
+	defer cancel()
 
-	// Fan-in all replica responses
+	ackCount := 0
+	responseChan := make(chan int, len(activeReplicas))
+
+	// Collect responses from all replicas
 	for _, replica := range activeReplicas {
 		go func(r *replicaConn) {
 			select {
 			case offset := <-r.ackChan:
 				if offset >= expectedOffset {
-					received <- 1
+					responseChan <- 1
 				} else {
-					received <- 0
+					responseChan <- 0
 				}
-			case <-timeout:
-				received <- 0
+			case <-ctx.Done():
+				responseChan <- 0
 			}
 		}(replica)
 	}
 
+	// Wait for responses until we have enough or timeout
 	for i := 0; i < len(activeReplicas); i++ {
 		select {
-		case ack := <-received:
+		case ack := <-responseChan:
 			ackCount += ack
 			if ackCount >= numReplicas {
 				return ackCount
 			}
-		case <-timeout:
+		case <-ctx.Done():
 			return ackCount
 		}
 	}
@@ -642,14 +689,15 @@ func propagateToReplicas(parts []string) {
 	}
 	data := []byte(builder.String())
 
-	// Update master offset
+	// Update master offset first
 	masterReplOffsetMu.Lock()
 	masterReplOffset += len(data)
 	masterReplOffsetMu.Unlock()
 
+	// Send to replicas with timeout, filter out dead connections
 	activeReplicas := make([]*replicaConn, 0, len(replicaConnections))
 	for _, replica := range replicaConnections {
-		_, err := replica.conn.Write(data)
+		err := writeToReplicaWithTimeout(replica.conn, data, 100*time.Millisecond)
 		if err == nil {
 			activeReplicas = append(activeReplicas, replica)
 		}
